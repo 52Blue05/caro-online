@@ -46,6 +46,7 @@ COMMON_OBJS := $(BUILD_DIR)/common/protocol.o
 # Server object files
 SERVER_OBJS := $(BUILD_DIR)/server/main.o \
                $(BUILD_DIR)/server/server.o \
+               $(BUILD_DIR)/server/game.o \
                $(COMMON_OBJS)
 
 # Client object files

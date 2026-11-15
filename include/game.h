@@ -52,13 +52,17 @@ typedef struct {
     game_status_t   status;
     game_result_t   result;
 
-    uint32_t        player_x_id;    /* Client or user ID playing X (goes first) */
-    uint32_t        player_o_id;    /* Client or user ID playing O */
+    int             player_x_fd;    /* Socket FD of player playing X (goes first) */
+    int             player_o_fd;    /* Socket FD of player playing O */
+    uint32_t        player_x_id;    /* User/Client ID playing X */
+    uint32_t        player_o_id;    /* User/Client ID playing O */
+    char            player_x_name[32];
+    char            player_o_name[32];
     caro_cell_t     current_turn;   /* CELL_X or CELL_O */
 
     caro_cell_t     board[CARO_BOARD_SIZE][CARO_BOARD_SIZE];
     uint32_t        move_count;
-    uint32_t        expected_seq;   /* Incremented with each valid move */
+    uint32_t        expected_seq;   /* Incremented with each valid move, starts at 1 */
 
     int             last_row;
     int             last_col;
@@ -66,28 +70,52 @@ typedef struct {
 
 /**
  * @brief Initialize a new game session between two players.
+ * 
+ * Sets player FDs/IDs, resets board, sets current_turn to CELL_X,
+ * sets status to GAME_STATUS_IN_PROGRESS, expected_seq to 1.
  */
-void game_init(game_t *game, uint32_t game_id, uint32_t player_x, uint32_t player_o);
+void game_init(game_t *game, uint32_t game_id,
+               int player_x_fd, int player_o_fd,
+               uint32_t player_x_id, uint32_t player_o_id);
 
 /**
- * @brief Reset board to empty cells.
+ * @brief Reset board to all empty cells.
  */
 void game_reset_board(game_t *game);
 
 /**
- * @brief Validate whether a move (row, col) is within bounds and unoccupied.
+ * @brief Validate whether a move (row, col) is within bounds [0..14] and unoccupied.
  */
 bool game_is_valid_move(const game_t *game, int row, int col);
 
 /**
+ * @brief Place a move on the board, update turn and check game status.
+ * 
+ * @param game Pointer to game session
+ * @param player Player making the move (CELL_X or CELL_O)
+ * @param row Row index (0..14)
+ * @param col Column index (0..14)
+ * @return true if move was applied successfully, false otherwise.
+ */
+bool game_make_move(game_t *game, caro_cell_t player, int row, int col);
+
+/**
  * @brief Check if placing a piece at (row, col) results in a win (>= 5 consecutive).
+ * 
+ * Evaluates 4 directions: horizontal, vertical, main diagonal, anti-diagonal.
+ * Overline rule (>= 6) is considered a win per project specification.
  */
 bool game_check_win(const game_t *game, int row, int col);
 
 /**
- * @brief Check if board is full (Draw).
+ * @brief Check if board is full (all 225 cells occupied without a winner -> Draw).
  */
 bool game_is_board_full(const game_t *game);
+
+/**
+ * @brief Get the cell value at (row, col). Returns CELL_EMPTY if out of bounds.
+ */
+caro_cell_t game_get_cell(const game_t *game, int row, int col);
 
 #ifdef __cplusplus
 }

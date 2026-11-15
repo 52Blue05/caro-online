@@ -33,10 +33,13 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    printf("=========================================\n");
-    printf("     CARO ONLINE TCP SERVER - SKELETON   \n");
-    printf("=========================================\n");
+    printf("====================================================\n");
+    printf("     CARO ONLINE TCP SERVER - EVENT LOOP & FRAMING  \n");
+    printf("====================================================\n");
 
+#if defined(SIGPIPE)
+    signal(SIGPIPE, SIG_IGN);
+#endif
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
 
@@ -46,7 +49,7 @@ int main(int argc, char *argv[]) {
     }
 
     if (test_mode) {
-        printf("[+] Skeleton verification mode: Server initialized successfully!\n");
+        printf("[+] Test mode: Server initialized and bound successfully!\n");
         server_cleanup(&g_server);
         return 0;
     }
