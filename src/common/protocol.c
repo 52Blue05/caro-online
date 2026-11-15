@@ -267,7 +267,12 @@ int protocol_parse_msg(const char *payload, size_t payload_len, protocol_msg_t *
     }
 
     /* First token is always command name */
-    strncpy(msg->cmd_str, msg->tokens[0], sizeof(msg->cmd_str) - 1);
+    size_t tok0_len = strlen(msg->tokens[0]);
+    if (tok0_len >= sizeof(msg->cmd_str)) {
+        tok0_len = sizeof(msg->cmd_str) - 1;
+    }
+    memcpy(msg->cmd_str, msg->tokens[0], tok0_len);
+    msg->cmd_str[tok0_len] = '\0';
     msg->cmd = protocol_cmd_from_str(msg->cmd_str);
 
     /* Command-specific parsing of extended fields */

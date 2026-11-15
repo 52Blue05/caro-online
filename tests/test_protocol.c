@@ -10,10 +10,10 @@ static int g_tests_passed = 0;
 #define TEST_ASSERT(cond, msg) do { \
     g_tests_run++; \
     if (!(cond)) { \
-        printf("[-] FAIL: %s (line %d): %s\n", __FUNCTION__, __LINE__, msg); \
+        printf("[-] FAIL: %s (line %d): %s\n", __func__, __LINE__, msg); \
     } else { \
         g_tests_passed++; \
-        printf("[+] PASS: %s: %s\n", __FUNCTION__, msg); \
+        printf("[+] PASS: %s: %s\n", __func__, msg); \
     } \
 } while(0)
 
