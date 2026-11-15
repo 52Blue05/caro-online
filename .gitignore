@@ -1,0 +1,49 @@
+# ==============================================================================
+# .gitignore - Online Caro Project (C/Linux)
+# ==============================================================================
+
+# Build artifacts & binaries
+bin/
+build/
+*.o
+*.obj
+*.so
+*.a
+*.exe
+caro_server
+caro_client
+test_protocol
+test_runner
+
+# Database & Data storage
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Log files & test output
+*.log
+logs/
+test_results/
+
+# Teamwork agent state directory (holds metadata only, not source)
+.agents/teamwork/
+
+# Editor / IDE configuration
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.patch
+
+# OS-generated files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Core dumps
+core
+core.*
