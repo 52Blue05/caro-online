@@ -161,8 +161,19 @@ static void client_display_server_message(const char *payload, size_t len) {
         }
 
         case CMD_ERR: {
-            const char *code_str = (msg.token_count > 1) ? msg.tokens[1] : "0";
-            const char *err_text = (msg.token_count > 2) ? msg.tokens[2] : "";
+            const char *code_str = "0";
+            const char *err_text = "";
+            if (msg.token_count >= 4) {
+                /* 4-token format: ERR\t<ref_id>\t<code>\t<message> */
+                code_str = msg.tokens[2];
+                err_text = msg.tokens[3];
+            } else if (msg.token_count == 3) {
+                /* 3-token format: ERR\t<code>\t<message> */
+                code_str = msg.tokens[1];
+                err_text = msg.tokens[2];
+            } else if (msg.token_count == 2) {
+                code_str = msg.tokens[1];
+            }
             printf("\n[SERVER ERROR %s] %s\n", code_str, err_text);
             break;
         }
@@ -252,6 +263,7 @@ static int client_run_batch_ping(const char *host, int port, const char *ping_ms
             }
         } else {
             fprintf(stderr, "[-] Connection closed by server\n");
+            printf("\n[CONNECTION LOST] Server disconnected or connection lost.\n");
         }
     }
 
@@ -328,6 +340,7 @@ static int client_run_interactive_loop(const char *host, int port) {
     uint8_t rx_buf[PROTO_MAX_FRAME_BUFFER];
     size_t rx_len = 0;
     bool running = true;
+    bool connection_lost = false;
 
 #if !defined(_WIN32)
     char stdin_buf[2048];
@@ -414,12 +427,15 @@ static int client_run_interactive_loop(const char *host, int port) {
                     }
                 }
             } else if (n == 0) {
-                printf("\n[!] Server closed the connection (EOF).\n");
+                printf("\n[CONNECTION LOST] Server disconnected or connection lost.\n");
+                connection_lost = true;
                 running = false;
                 break;
             } else {
                 if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
                     perror("\n[-] Socket read error");
+                    printf("\n[CONNECTION LOST] Server disconnected or connection lost.\n");
+                    connection_lost = true;
                     running = false;
                     break;
                 }
@@ -485,9 +501,18 @@ static int client_run_interactive_loop(const char *host, int port) {
                     }
                 }
             } else if (n == 0) {
-                printf("\n[!] Server closed connection (EOF).\n");
+                printf("\n[CONNECTION LOST] Server disconnected or connection lost.\n");
+                connection_lost = true;
                 running = false;
                 break;
+            } else {
+                int wsa_err = WSAGetLastError();
+                if (wsa_err != WSAEWOULDBLOCK && wsa_err != WSAEINTR) {
+                    printf("\n[CONNECTION LOST] Server disconnected or connection lost.\n");
+                    connection_lost = true;
+                    running = false;
+                    break;
+                }
             }
         }
 
@@ -507,8 +532,10 @@ static int client_run_interactive_loop(const char *host, int port) {
 
     printf("[*] Closing client socket...\n");
     socket_close(sock_fd);
-    printf("[+] Client exited cleanly.\n");
-    return 0;
+    if (!connection_lost) {
+        printf("[+] Client exited cleanly.\n");
+    }
+    return connection_lost ? 1 : 0;
 }
 
 /* Quick Client Self-Test */
@@ -556,8 +583,38 @@ static int client_run_self_test(void) {
     }
     printf("[+] Test 4 passed: protocol_parse_msg correctly decodes CMD_PONG\n");
 
+    /* Test 5: Parse 3-token and 4-token ERR response */
+    const char *err3_wire = "ERR\t401\tNot your turn\n";
+    res = protocol_parse_msg(err3_wire, strlen(err3_wire), &msg);
+    if (res != PROTO_OK || msg.cmd != CMD_ERR || msg.token_count != 3 || strcmp(msg.tokens[1], "401") != 0) {
+        fprintf(stderr, "[-] Test 5a failed: protocol_parse_msg on 3-token ERR\n");
+        return 1;
+    }
+    const char *err4_wire = "ERR\t1001\t201\tAuth failed\n";
+    res = protocol_parse_msg(err4_wire, strlen(err4_wire), &msg);
+    if (res != PROTO_OK || msg.cmd != CMD_ERR || msg.token_count != 4 || msg.request_id != 1001 || strcmp(msg.tokens[2], "201") != 0) {
+        fprintf(stderr, "[-] Test 5b failed: protocol_parse_msg on 4-token ERR\n");
+        return 1;
+    }
+    printf("[+] Test 5 passed: protocol_parse_msg handles 3-token and 4-token ERR\n");
+
+    /* Test 6: Parse MOVE validates coords and token count */
+    const char *move_wire = "MOVE\t1\t5\t7\t8\n";
+    res = protocol_parse_msg(move_wire, strlen(move_wire), &msg);
+    if (res != PROTO_OK || msg.cmd != CMD_MOVE || msg.move_row != 7 || msg.move_col != 8) {
+        fprintf(stderr, "[-] Test 6a failed: protocol_parse_msg on valid MOVE\n");
+        return 1;
+    }
+    const char *bad_move = "MOVE\t1\t5\n";
+    res = protocol_parse_msg(bad_move, strlen(bad_move), &msg);
+    if (res == PROTO_OK) {
+        fprintf(stderr, "[-] Test 6b failed: incomplete MOVE was not rejected\n");
+        return 1;
+    }
+    printf("[+] Test 6 passed: protocol_parse_msg validates MOVE token count and coordinates\n");
+
     printf("=========================================\n");
-    printf("[+] All client self-tests passed (4/4)\n");
+    printf("[+] All client self-tests passed (6/6)\n");
     printf("=========================================\n");
     return 0;
 }

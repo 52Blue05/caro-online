@@ -43,6 +43,7 @@ test_results/
 .DS_Store
 Thumbs.db
 desktop.ini
+*.zip
 
 # Core dumps
 core

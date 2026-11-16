@@ -21,31 +21,35 @@ caro-online/
 ├── Makefile                    # Hệ thống build tự động chuẩn POSIX C11 (GCC)
 ├── .gitignore                  # Bỏ qua binary, object, db, logs, agent state
 ├── README.md                   # Tài liệu tổng quan và hướng dẫn build/chạy/test
-├── bin/                        # File thực thi sau khi biên dịch (caro_server, caro_client, test_protocol)
+├── bin/                        # File thực thi (caro_server, caro_client, test_protocol, test_game)
 ├── build/                      # Intermediate object files (*.o)
 ├── include/                    # Header files công khai
-│   ├── protocol.h              # Giao thức framing nhị phân 4 byte, enum lệnh và struct thông điệp
-│   ├── server.h                # Cấu trúc server, client context và API socket non-blocking
-│   └── game.h                  # Bàn cờ 15x15 Gomoku, trạng thái ô, luật thắng >= 5 quân & overline
+│   ├── protocol.h              # Giao thức framing nhị phân 4 byte, strict parser và struct thông điệp
+│   ├── server.h                # Cấu trúc server, client context, RX/TX buffers, quotas & timeouts
+│   └── game.h                  # Bàn cờ 15x15 Gomoku, trạng thái ô, luật thắng >= 5 quân, overline & hòa
 ├── src/                        # Mã nguồn C
 │   ├── common/                 # Module dùng chung
-│   │   └── protocol.c          # Đóng gói và giải mã khung dữ liệu nhị phân / phân tách TAB
+│   │   └── protocol.c          # Đóng gói, unpack khung, strict parser số và phân tách TAB
 │   ├── server/                 # Module Server
 │   │   ├── main.c              # Server CLI entry point và xử lý tín hiệu SIGINT/SIGTERM
-│   │   ├── server.c            # Event loop poll() non-blocking, bộ đệm RX/TX và dispatch PING/PONG
-│   │   └── game.c              # Thuật toán kiểm tra thắng thua Caro Gomoku 15x15 genuine
+│   │   ├── server.c            # Event loop poll() non-blocking, RX/TX quotas, dọn dẹp FD an toàn
+│   │   └── game.c              # Thuật toán luật cờ Caro Gomoku 15x15 độc lập 100% với mạng/SQL
 │   └── client/                 # Module Client CLI
-│       └── main.c              # Client CLI đa kênh poll() giữa stdin và socket, hỗ trợ ping/help/quit
-├── tests/                      # Kiểm thử đơn vị và tích hợp
-│   ├── test_protocol.c         # Bộ 52 unit tests kiểm tra giao thức & framing
-│   ├── test_integration_g1.py  # Kịch bản kiểm thử tích hợp 2 client đồng thời & nghiệm thu G1
-│   ├── test_integration_g1.sh  # Script shell chạy trọn gói kiểm thử nghiệm thu G1
-│   └── test_g1_results.log     # Nhật ký kết quả kiểm thử thực tế mốc G1
+│       └── main.c              # Client CLI đa kênh poll() giữa stdin và socket, in lỗi và mất kết nối
+├── tests/                      # Kiểm thử đơn vị, đối kháng và tích hợp
+│   ├── test_protocol.c         # Bộ 73 unit tests kiểm tra giao thức & parser
+│   ├── test_game.c             # Bộ 134 unit tests kiểm tra luật cờ Caro 15x15 độc lập
+│   ├── test_g2_suite.py        # Kịch bản E2E kiểm tra tải 20 kết nối, framing biên và rò rỉ FD
+│   ├── test_g2.sh              # Script shell chạy trọn gói nghiệm thu Mốc G2
+│   ├── test_g2_results.log     # Nhật ký kết quả kiểm thử thực tế mốc G2
+│   ├── test_integration_g1.py  # Kịch bản kiểm thử tích hợp mốc G1
+│   └── test_integration_g1.sh  # Script shell chạy trọn gói nghiệm thu Mốc G1
 └── docs/                       # Tài liệu thiết kế kiến trúc, ca sử dụng, giao thức, tiến độ
     ├── architecture.md         # Kiến trúc hệ thống và luồng dữ liệu
     ├── protocol.md             # Đặc tả giao thức tầng ứng dụng
     ├── use_cases.md            # Đặc tả 22 ca sử dụng toàn dự án
-    └── progress_week1.md       # Báo cáo tiến độ và bằng chứng kiểm thử 8 checklist Tuần 1
+    ├── progress_week1.md       # Báo cáo tiến độ và bằng chứng kiểm thử Tuần 1 (Mốc G1)
+    └── progress_week2.md       # Báo cáo tiến độ và bằng chứng kiểm thử Tuần 2 (Mốc G2)
 ```
 
 ---
@@ -167,3 +171,27 @@ Toàn bộ 8/8 đầu việc theo kế hoạch Tuần 1 đã hoàn thành xuất
 - [x] **T1H4**: Kiểm chứng mốc hai client đồng thời và nghiệm thu G1 (7/7 suites pass, log tại `tests/test_g1_results.log`).
 
 Chi tiết xem tại tài liệu nghiệm thu: [`docs/progress_week1.md`](docs/progress_week1.md).
+
+---
+
+## 8. Báo Cáo Tiến Độ Tuần 2 (Đạt Mốc Nghiệm Thu G2)
+
+Toàn bộ 8/8 đầu việc theo kế hoạch Tuần 2 đã hoàn thành xuất sắc 100% và được kiểm toán độc lập xác nhận (**VICTORY CONFIRMED**):
+- [x] **T2N1**: Hoàn thiện RX và TX non-blocking tích lũy khung, xử lý partial write offset, từ chối header > 4KB hoặc độ dài 0 byte.
+- [x] **T2N2**: Ngân sách xử lý 16 khung/vòng lặp, timeout 30s chống slowloris, starvation decoupling xử lý dứt điểm các burst gói tin gộp, `POLLOUT` chỉ bật khi còn dữ liệu.
+- [x] **T2N3**: Quản lý phiên và trạng thái client riêng biệt (`CLIENT_STATE_CONNECTED`, `CLIENT_STATE_AUTH`, v.v.), phân biệt phiên tạm `guest_<fd>` với tài khoản thật.
+- [x] **T2N4**: Rà soát đóng socket và giải phóng bộ nhớ, kiểm chứng `/proc/<pid>/fd` phục hồi đúng 5 baseline FDs sau bão kết nối (0 descriptor leak).
+- [x] **T2H1**: Hoàn thiện module luật Caro 15x15 Gomoku độc lập 100% với mạng/SQL (thắng 4 hướng, overline ≥6 quân, hòa 225 ô — 134/134 assertions pass).
+- [x] **T2H2**: Hardening parser (`parse_strict_uint32`), từ chối số âm, số tràn, thiếu trường, tọa độ ngoài 15x15; CLI hiển thị `[SERVER ERROR]` và `[CONNECTION LOST]`.
+- [x] **T2H3**: Bot kiểm thử 20 kết nối đồng thời với lưu lượng hỗn hợp (rapid, fragmented 1B/10ms, coalesced burst, slow drip) đạt 100% message echo.
+- [x] **T2H4**: Bổ sung kiểm thử luật 4 góc, thắng ≥6 quân, hòa 225 ô và 938,342 lượt fuzz test đối kháng không phát hiện lỗi.
+
+### Lệnh chạy kiểm thử nghiệm thu Mốc G2:
+```bash
+# Chạy bộ test tự động trọn gói Mốc G2:
+bash tests/test_g2.sh
+
+# Chạy riêng unit test luật cờ Caro 15x15 (134 assertions):
+make test_game
+```
+Chi tiết xem tại tài liệu nghiệm thu: [`docs/progress_week2.md`](docs/progress_week2.md).

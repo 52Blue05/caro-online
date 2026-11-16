@@ -98,10 +98,12 @@ typedef struct {
     char        cmd_str[32];
     int         token_count;
     char        tokens[PROTO_MAX_TOKENS][PROTO_MAX_TOKEN_LEN];
-    /* Extended fields (0 if not applicable) */
+    /* Extended fields (0 or -1 if not applicable) */
     uint32_t    request_id;
     uint32_t    game_id;
     uint32_t    seq;
+    int         move_row;
+    int         move_col;
     /* Raw payload copy (null-terminated, without trailing '\n') */
     char        raw_payload[PROTO_MAX_PAYLOAD_SIZE + 1];
     size_t      raw_payload_len;

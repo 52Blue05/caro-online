@@ -13,8 +13,10 @@ ifeq ($(OS),Windows_NT)
     SERVER_BIN := $(BIN_DIR)/caro_server.exe
     CLIENT_BIN := $(BIN_DIR)/caro_client.exe
     TEST_BIN   := $(BIN_DIR)/test_protocol.exe
+    TEST_GAME_BIN := $(BIN_DIR)/test_game.exe
     LDFLAGS    += -lws2_32
     RUN_TEST   = $(subst /,\,$(TEST_BIN))
+    RUN_TEST_GAME = $(subst /,\,$(TEST_GAME_BIN))
 define MAKE_DIRS
 	@if not exist "$(subst /,\,$(BIN_DIR))" mkdir "$(subst /,\,$(BIN_DIR))"
 	@if not exist "$(subst /,\,$(BUILD_DIR))" mkdir "$(subst /,\,$(BUILD_DIR))"
@@ -31,7 +33,9 @@ else
     SERVER_BIN := $(BIN_DIR)/caro_server
     CLIENT_BIN := $(BIN_DIR)/caro_client
     TEST_BIN   := $(BIN_DIR)/test_protocol
+    TEST_GAME_BIN := $(BIN_DIR)/test_game
     RUN_TEST   = ./$(TEST_BIN)
+    RUN_TEST_GAME = ./$(TEST_GAME_BIN)
 define MAKE_DIRS
 	@mkdir -p $(BIN_DIR) $(BUILD_DIR)/server $(BUILD_DIR)/client $(BUILD_DIR)/common $(BUILD_DIR)/tests
 endef
@@ -56,8 +60,10 @@ CLIENT_OBJS := $(BUILD_DIR)/client/main.o \
 # Test object files
 TEST_OBJS   := $(BUILD_DIR)/tests/test_protocol.o \
                $(COMMON_OBJS)
+TEST_GAME_OBJS := $(BUILD_DIR)/tests/test_game.o \
+                  $(BUILD_DIR)/server/game.o
 
-.PHONY: all server client test clean dirs
+.PHONY: all server client test test_game clean dirs
 
 all: dirs server client test
 
@@ -68,9 +74,15 @@ server: dirs $(SERVER_BIN)
 
 client: dirs $(CLIENT_BIN)
 
-test: dirs $(TEST_BIN)
+test: dirs $(TEST_BIN) $(TEST_GAME_BIN)
 	@echo [TEST] Executing $(TEST_BIN)...
 	@$(RUN_TEST)
+	@echo [TEST] Executing $(TEST_GAME_BIN)...
+	@$(RUN_TEST_GAME)
+
+test_game: dirs $(TEST_GAME_BIN)
+	@echo [TEST] Executing $(TEST_GAME_BIN)...
+	@$(RUN_TEST_GAME)
 
 $(SERVER_BIN): $(SERVER_OBJS)
 	@echo [LD] $@
@@ -81,6 +93,10 @@ $(CLIENT_BIN): $(CLIENT_OBJS)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
 $(TEST_BIN): $(TEST_OBJS)
+	@echo [LD] $@
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+
+$(TEST_GAME_BIN): $(TEST_GAME_OBJS)
 	@echo [LD] $@
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 

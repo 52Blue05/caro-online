@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="vi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Cờ Caro · IT4062</title>
+<style>
+:root{color-scheme:dark;--mint:#65e7bb;--line:#304454}*{box-sizing:border-box}body{margin:0;background:#0d1720;color:#edf5f8;font:15px/1.5 system-ui,sans-serif}main{max-width:1130px;margin:auto;padding:24px}header{display:flex;justify-content:space-between;align-items:end;flex-wrap:wrap;gap:10px}h1{font-size:clamp(29px,5vw,48px);letter-spacing:-.04em;margin:4px 0}h2{font-size:18px;margin:0 0 10px}small,p{color:#b2c4d1}p{margin:5px 0}.k{color:var(--mint);letter-spacing:.14em;font-size:11px;font-weight:bold}.layout{display:grid;grid-template-columns:230px minmax(0,1fr) 200px;gap:12px;align-items:start}section,aside{border:1px solid var(--line);background:#15212d;border-radius:14px;padding:14px;min-width:0}button,select{font:inherit;border:1px solid #3b5464;background:#203341;color:inherit;border-radius:8px;padding:7px 9px}button{cursor:pointer}button:hover:not(:disabled),button:focus-visible,.selected{border-color:var(--mint);outline-color:var(--mint)}.primary{color:#102820;background:var(--mint);font-weight:700;border-color:var(--mint)}.bar{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0}.row{display:flex;justify-content:space-between;gap:6px;border-bottom:1px solid var(--line);padding:6px 0}.notice{margin:14px 0;padding:9px 12px;border-left:3px solid var(--mint);background:#1a2c38;overflow-wrap:anywhere}.board{display:grid;grid-template-columns:repeat(15,minmax(0,1fr));gap:1px;background:#344c5d;border:1px solid #344c5d;border-radius:8px;overflow:hidden;margin:12px auto;max-width:550px}.cell{padding:0;border:0;border-radius:0;aspect-ratio:1;background:#1a2d3a;font-size:clamp(11px,2vw,19px);font-weight:800}.cell:hover:not(:disabled){background:#325063}.X{color:var(--mint)}.O{color:#ffbc77}ol{max-height:260px;overflow:auto;padding-left:20px;font-size:13px}.pill{color:var(--mint);font-weight:700}.empty{padding:40px 10px;text-align:center;border:1px dashed var(--line);margin-top:10px;border-radius:9px}
+@media(max-width:900px){.layout{grid-template-columns:190px minmax(0,1fr)}aside{grid-column:1/-1}}@media(max-width:580px){main{padding:12px}.layout{display:flex;flex-direction:column}section,aside{width:100%}}
+</style></head><body><main>
+<header><div><div class="k">IT4062 / NHÓM 8 / PROTOTYPE</div><h1>Cờ Caro trực tuyến</h1><p>Mô phỏng ngoại tuyến · Bàn cờ 15 × 15</p></div><div class="bar"><button class="primary" data-action="samples">Hai ván mẫu</button><button data-action="reset">Làm mới</button></div></header>
+<div class="notice" id="notice" role="status"></div>
+<div class="layout"><section><h2>Sảnh người chơi</h2><div id="lobby"></div></section><section><h2>Phòng đấu</h2><div class="bar" id="tabs"></div><div id="game"></div></section><aside><h2>Bảng điểm</h2><div id="rank"></div><h3>Nhật ký ván</h3><ol id="log"></ol></aside></div>
+</main><script>
+const $=id=>document.getElementById(id);
+let s;
+const names=['Hưng','Nam','Linh','Minh'];
+const p=id=>s.players[id];
+const opponent=(m,id)=>id===m.x?m.o:m.x;
+function start(x,o){
+  const id=s.next++;
+  const m={id,x,o,view:x,turn:'X',board:Array(225).fill(''),log:[],active:true,result:''};
+  s.matches.set(id,m);p(x).match=id;p(o).match=id;s.selected=id;
+  return m;
+}
+function reset(sample=false){
+  s={players:names.map((name,id)=>({id,name,online:sample||id!==0,match:null,points:0})),actor:sample?0:null,invite:null,next:42,matches:new Map(),selected:null};
+  if(sample){start(0,1);start(2,3);s.selected=42;}
+  show(sample?'Ván 42 và 43 sẵn sàng. Hãy đánh xen kẽ ở hai ván.':'Vào sảnh để thách đấu hoặc mở hai ván mẫu.');
+}
+function win(board,index,stone){
+  const r=Math.floor(index/15),c=index%15;
+  return [[0,1],[1,0],[1,1],[1,-1]].some(([dr,dc])=>{
+    let count=1;
+    for(const sign of [-1,1]){
+      let y=r+sign*dr,x=c+sign*dc;
+      while(y>=0&&y<15&&x>=0&&x<15&&board[y*15+x]===stone){count++;y+=sign*dr;x+=sign*dc;}
+    }
+    return count>=5;
+  });
+}
+function finish(m,winner,reason){
+  if(!m.active)return;
+  m.active=false;p(m.x).match=null;p(m.o).match=null;
+  if(winner===null){p(m.x).points++;p(m.o).points++;m.result='Hòa · '+reason;}
+  else{p(winner).points+=3;m.result=p(winner).name+' thắng · '+reason;}
+  show('GAME_END · Ván '+m.id+' · '+m.result);
+}
+function move(m,id,index){
+  if(!m.active)return show('Ván đã kết thúc.');
+  if(id!==m.x&&id!==m.o)return show('NOT_IN_MATCH · Người gửi không thuộc ván.');
+  const stone=id===m.x?'X':'O';
+  if(m.turn!==stone)return show('NOT_YOUR_TURN · Chưa tới lượt. Bàn cờ không đổi.');
+  if(!Number.isInteger(index)||index<0||index>=225)return show('BAD_COORDINATE · Ô không hợp lệ.');
+  if(m.board[index])return show('CELL_OCCUPIED · Ô đã có quân.');
+  const label=stone+' → ('+(Math.floor(index/15)+1)+', '+(index%15+1)+')';
+  m.board[index]=stone;m.log.push(label);
+  if(win(m.board,index,stone))return finish(m,id,'5 quân liên tiếp trở lên');
+  if(m.log.length===225)return finish(m,null,'Bàn đầy');
+  m.turn=stone==='X'?'O':'X';
+  show('MOVE_ACCEPTED · Ván '+m.id+' · '+label);
+}
+function show(message){
+  $('notice').textContent=message;
+  const a=s.actor,i=s.invite;
+  const idle=s.players.filter(q=>q.online&&q.match===null&&q.id!==a);
+  const select=(id,label,list,selected)=>'<select id="'+id+'" aria-label="'+label+'">'+list.map(q=>'<option value="'+q.id+'" '+(q.id===selected?'selected':'')+'>'+q.name+'</option>').join('')+'</select>';
+  $('lobby').innerHTML=(a===null?'<button class="primary" data-action="login">Vào sảnh (Hưng)</button>':'<p>Góc nhìn sảnh</p>'+select('actor','Góc nhìn sảnh',s.players.filter(q=>q.online),a))+
+    s.players.map(q=>'<div class="row">'+q.name+'<small>'+(!q.online?'Offline':q.match===null?'Rảnh':'Ván '+q.match)+'</small></div>').join('')+
+    (!i&&a!==null&&p(a).match===null&&idle.length?'<div class="bar">'+select('target','Đối thủ',idle)+'<button data-action="invite">Gửi lời mời</button></div>':'')+
+    (i?'<p>'+p(i.a).name+' mời '+p(i.b).name+' · hạn 30 giây</p>'+(a===i.b?'<div class="bar"><button class="primary" data-action="accept">Chấp nhận</button><button data-action="decline">Từ chối</button></div>':'<small>Đổi góc nhìn sảnh sang người được mời.</small>'):'');
+  $('tabs').innerHTML=[...s.matches.values()].map(m=>'<button data-action="tab" data-id="'+m.id+'" aria-pressed="'+(m.id===s.selected)+'" class="'+(m.id===s.selected?'selected':'')+'">Ván '+m.id+(m.active?'':' · Xong')+'</button>').join('');
+  $('rank').innerHTML=[...s.players].sort((a,b)=>b.points-a.points).map(q=>'<div class="row">'+q.name+'<strong>'+q.points+' đ</strong></div>').join('');
+  const m=s.matches.get(s.selected);
+  $('log').innerHTML=m?[...m.log,...(m.result?[m.result]:[])].map(v=>'<li>'+v+'</li>').join(''):'<li>Chưa có ván.</li>';
+  $('game').innerHTML=!m?'<div class="empty">Chưa có ván. Gửi lời mời hoặc mở hai ván mẫu.</div>':
+    '<p><strong>'+p(m.x).name+' (X) – '+p(m.o).name+' (O)</strong></p><p class="pill">'+(m.active?'Lượt '+m.turn+' · Đang thao tác: '+p(m.view).name:m.result)+'</p>'+
+    '<div class="board" aria-label="Bàn cờ">'+m.board.map((v,k)=>'<button class="cell '+v+'" data-action="move" data-id="'+k+'" aria-label="Hàng '+(Math.floor(k/15)+1)+', cột '+(k%15+1)+(v?', quân '+v:', ô trống')+'" '+(m.active?'':'disabled')+'>'+v+'</button>').join('')+'</div>'+
+    (m.active?'<div class="bar"><button data-action="swap">Đổi góc nhìn</button><button data-action="wrong">Gửi sai lượt</button><button data-action="resign">Đầu hàng</button><button data-action="drop">Mô phỏng mất kết nối</button></div>':'');
+}
+function reply(accept){
+  const i=s.invite;
+  if(!i||s.actor!==i.b)return;
+  s.invite=null;
+  if(Date.now()>=i.deadline)return show('INVITE_EXPIRED · Lời mời hết hạn.');
+  if(!accept)return show('Lời mời đã bị từ chối.');
+  if([i.a,i.b].some(id=>!p(id).online||p(id).match!==null))return show('PLAYER_BUSY · Không tạo ván.');
+  const m=start(i.a,i.b);
+  show('GAME_START · Ván '+m.id+' đã bắt đầu. X đi trước.');
+}
+document.addEventListener('change',e=>{if(e.target.id==='actor'){s.actor=Number(e.target.value);show('Góc nhìn sảnh: '+p(s.actor).name);}});
+document.addEventListener('click',e=>{
+  const b=e.target.closest('button[data-action]');
+  if(!b||b.disabled)return;
+  const m=s.matches.get(s.selected);
+  switch(b.dataset.action){
+    case 'samples':return reset(true);
+    case 'reset':return reset();
+    case 'login':p(0).online=true;s.actor=0;return show('LOGIN_OK · Hưng đã vào sảnh.');
+    case 'invite':s.invite={a:s.actor,b:Number($('target').value),deadline:Date.now()+30000};return show('CHALLENGE_NOTIFY · Lời mời đã gửi.');
+    case 'accept':return reply(true);
+    case 'decline':return reply(false);
+    case 'tab':s.selected=Number(b.dataset.id);return show('Đang xem ván '+s.selected+'.');
+    case 'move':return move(m,m.view,Number(b.dataset.id));
+    case 'swap':m.view=opponent(m,m.view);return show('Góc nhìn bàn cờ: '+p(m.view).name);
+    case 'wrong':return move(m,m.turn==='X'?m.o:m.x,0);
+    case 'resign':return finish(m,opponent(m,m.view),'Đối thủ đầu hàng');
+    case 'drop':
+      p(m.view).online=false;
+      if(s.actor===m.view)s.actor=s.players.find(q=>q.online)?.id??null;
+      if(s.invite&&[s.invite.a,s.invite.b].includes(m.view))s.invite=null;
+      return finish(m,opponent(m,m.view),'Đối thủ mất kết nối');
+  }
+});
+setInterval(()=>{if(s.invite&&Date.now()>=s.invite.deadline){s.invite=null;show('INVITE_EXPIRED · Lời mời hết hạn.');}},500);
+reset();
+</script></body></html>

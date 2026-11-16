@@ -197,6 +197,8 @@ static void test_parse_msg_various(void) {
     TEST_ASSERT(msg.seq == 7, "Parsed seq == 7");
     TEST_ASSERT(strcmp(msg.tokens[3], "8") == 0, "Parsed x == 8");
     TEST_ASSERT(strcmp(msg.tokens[4], "9") == 0, "Parsed y == 9");
+    TEST_ASSERT(msg.move_row == 8, "Parsed move_row == 8");
+    TEST_ASSERT(msg.move_col == 9, "Parsed move_col == 9");
 
     /* Test LOGIN with request_id */
     res = protocol_parse_msg("LOGIN\t1001\talice\tsecret\n", 0, &msg);
@@ -223,6 +225,186 @@ static void test_helpers(void) {
     TEST_ASSERT(err_str != NULL && strlen(err_str) > 0, "protocol_err_str returns valid string");
 }
 
+/* Test 11: Missing required tokens rejected */
+static void test_parse_msg_missing_tokens(void) {
+    protocol_msg_t msg;
+
+    /* CMD_MOVE requires at least 5 tokens */
+    TEST_ASSERT(protocol_parse_msg("MOVE\n", 0, &msg) == PROTO_ERR_INVALID_PARAM,
+                "MOVE with 1 token rejected");
+    TEST_ASSERT(protocol_parse_msg("MOVE\t1\n", 0, &msg) == PROTO_ERR_INVALID_PARAM,
+                "MOVE with 2 tokens rejected");
+    TEST_ASSERT(protocol_parse_msg("MOVE\t1\t1\n", 0, &msg) == PROTO_ERR_INVALID_PARAM,
+                "MOVE with 3 tokens rejected");
+    TEST_ASSERT(protocol_parse_msg("MOVE\t1\t1\t7\n", 0, &msg) == PROTO_ERR_INVALID_PARAM,
+                "MOVE with 4 tokens rejected");
+
+    /* CMD_LOGIN and CMD_REGISTER require at least 4 tokens */
+    TEST_ASSERT(protocol_parse_msg("LOGIN\n", 0, &msg) == PROTO_ERR_INVALID_PARAM,
+                "LOGIN with 1 token rejected");
+    TEST_ASSERT(protocol_parse_msg("LOGIN\t1001\n", 0, &msg) == PROTO_ERR_INVALID_PARAM,
+                "LOGIN with 2 tokens rejected");
+    TEST_ASSERT(protocol_parse_msg("LOGIN\t1001\talice\n", 0, &msg) == PROTO_ERR_INVALID_PARAM,
+                "LOGIN with 3 tokens rejected");
+    TEST_ASSERT(protocol_parse_msg("REGISTER\n", 0, &msg) == PROTO_ERR_INVALID_PARAM,
+                "REGISTER with 1 token rejected");
+    TEST_ASSERT(protocol_parse_msg("REGISTER\t1001\talice\n", 0, &msg) == PROTO_ERR_INVALID_PARAM,
+                "REGISTER with 3 tokens rejected");
+
+    /* CMD_CHALLENGE requires at least 3 tokens */
+    TEST_ASSERT(protocol_parse_msg("CHALLENGE\n", 0, &msg) == PROTO_ERR_INVALID_PARAM,
+                "CHALLENGE with 1 token rejected");
+    TEST_ASSERT(protocol_parse_msg("CHALLENGE\t1001\n", 0, &msg) == PROTO_ERR_INVALID_PARAM,
+                "CHALLENGE with 2 tokens rejected");
+
+    /* CMD_ERR requires at least 3 tokens */
+    TEST_ASSERT(protocol_parse_msg("ERR\n", 0, &msg) == PROTO_ERR_INVALID_PARAM,
+                "ERR with 1 token rejected");
+    TEST_ASSERT(protocol_parse_msg("ERR\t101\n", 0, &msg) == PROTO_ERR_INVALID_PARAM,
+                "ERR with 2 tokens rejected");
+}
+
+/* Test 12: Integer overflow rejected */
+static void test_parse_msg_integer_overflow(void) {
+    protocol_msg_t msg;
+
+    /* game_id > UINT32_MAX (4294967296) */
+    TEST_ASSERT(protocol_parse_msg("MOVE\t4294967296\t1\t7\t7\n", 0, &msg) == PROTO_ERR_INVALID_PARAM,
+                "MOVE with game_id > UINT32_MAX rejected");
+
+    /* seq extreme overflow (> ULLONG_MAX / ERANGE) */
+    TEST_ASSERT(protocol_parse_msg("MOVE\t1\t99999999999999999999999999999999\t7\t7\n", 0, &msg) == PROTO_ERR_INVALID_PARAM,
+                "MOVE with seq overflow (ERANGE) rejected");
+
+    /* request_id 5 billion > UINT32_MAX */
+    TEST_ASSERT(protocol_parse_msg("LOGIN\t5000000000\talice\tsecret\n", 0, &msg) == PROTO_ERR_INVALID_PARAM,
+                "LOGIN with request_id = 5000000000 rejected");
+
+    /* Exact boundary UINT32_MAX (4294967295) should succeed */
+    int res = protocol_parse_msg("MOVE\t4294967295\t4294967295\t7\t7\n", 0, &msg);
+    TEST_ASSERT(res == PROTO_OK, "MOVE with UINT32_MAX values succeeds");
+    TEST_ASSERT(msg.game_id == 4294967295U, "game_id parsed as UINT32_MAX");
+    TEST_ASSERT(msg.seq == 4294967295U, "seq parsed as UINT32_MAX");
+}
+
+/* Test 13: Negative numbers rejected */
+static void test_parse_msg_negative_numbers(void) {
+    protocol_msg_t msg;
+
+    TEST_ASSERT(protocol_parse_msg("MOVE\t-1\t1\t7\t7\n", 0, &msg) == PROTO_ERR_INVALID_PARAM,
+                "Negative game_id rejected");
+    TEST_ASSERT(protocol_parse_msg("MOVE\t1\t-100\t7\t7\n", 0, &msg) == PROTO_ERR_INVALID_PARAM,
+                "Negative seq rejected");
+    TEST_ASSERT(protocol_parse_msg("MOVE\t1\t1\t-1\t7\n", 0, &msg) == PROTO_ERR_INVALID_PARAM,
+                "Negative row rejected");
+    TEST_ASSERT(protocol_parse_msg("MOVE\t1\t1\t7\t-5\n", 0, &msg) == PROTO_ERR_INVALID_PARAM,
+                "Negative col rejected");
+    TEST_ASSERT(protocol_parse_msg("LOGIN\t-1\talice\tsecret\n", 0, &msg) == PROTO_ERR_INVALID_PARAM,
+                "Negative request_id rejected");
+    TEST_ASSERT(protocol_parse_msg("ERR\t-101\tNegative error\n", 0, &msg) == PROTO_ERR_INVALID_PARAM,
+                "Negative error code rejected");
+}
+
+/* Test 14: Non-numeric strings rejected */
+static void test_parse_msg_non_numeric(void) {
+    protocol_msg_t msg;
+
+    TEST_ASSERT(protocol_parse_msg("MOVE\tabc\t1\t7\t7\n", 0, &msg) == PROTO_ERR_INVALID_PARAM,
+                "Non-numeric game_id rejected");
+    TEST_ASSERT(protocol_parse_msg("MOVE\t1\txyz\t7\t7\n", 0, &msg) == PROTO_ERR_INVALID_PARAM,
+                "Non-numeric seq rejected");
+    TEST_ASSERT(protocol_parse_msg("MOVE\t1\t1\trow\t7\n", 0, &msg) == PROTO_ERR_INVALID_PARAM,
+                "Non-numeric row rejected");
+    TEST_ASSERT(protocol_parse_msg("MOVE\t1\t1\t7\tcol\n", 0, &msg) == PROTO_ERR_INVALID_PARAM,
+                "Non-numeric col rejected");
+    TEST_ASSERT(protocol_parse_msg("MOVE\t1\t1\t12a\t7\n", 0, &msg) == PROTO_ERR_INVALID_PARAM,
+                "Trailing alphanumeric row rejected");
+    TEST_ASSERT(protocol_parse_msg("LOGIN\tabc\talice\tsecret\n", 0, &msg) == PROTO_ERR_INVALID_PARAM,
+                "Non-numeric request_id rejected");
+    TEST_ASSERT(protocol_parse_msg("ERR\tbad_code\tBad\n", 0, &msg) == PROTO_ERR_INVALID_PARAM,
+                "Non-numeric ERR code rejected");
+}
+
+/* Test 15: Out-of-range Caro board coordinates (0..14) */
+static void test_parse_msg_out_of_range_coords(void) {
+    protocol_msg_t msg;
+
+    TEST_ASSERT(protocol_parse_msg("MOVE\t1\t1\t15\t7\n", 0, &msg) == PROTO_ERR_INVALID_PARAM,
+                "MOVE with row 15 rejected (board is 15x15, valid is 0..14)");
+    TEST_ASSERT(protocol_parse_msg("MOVE\t1\t1\t7\t15\n", 0, &msg) == PROTO_ERR_INVALID_PARAM,
+                "MOVE with col 15 rejected (board is 15x15, valid is 0..14)");
+    TEST_ASSERT(protocol_parse_msg("MOVE\t1\t1\t100\t7\n", 0, &msg) == PROTO_ERR_INVALID_PARAM,
+                "MOVE with row 100 rejected");
+
+    /* Boundary 0 and 14 must pass */
+    int res = protocol_parse_msg("MOVE\t1\t1\t0\t0\n", 0, &msg);
+    TEST_ASSERT(res == PROTO_OK, "MOVE with (0,0) succeeds");
+    TEST_ASSERT(msg.move_row == 0 && msg.move_col == 0, "Parsed (0,0) correctly");
+
+    res = protocol_parse_msg("MOVE\t1\t1\t14\t14\n", 0, &msg);
+    TEST_ASSERT(res == PROTO_OK, "MOVE with (14,14) succeeds");
+    TEST_ASSERT(msg.move_row == 14 && msg.move_col == 14, "Parsed (14,14) correctly");
+}
+
+/* Test 16: Oversized payload header (> 4096) immediately rejected */
+static void test_unpack_oversized_payload_header(void) {
+    uint8_t wire[8];
+    char out_payload[32];
+    size_t out_len = 0;
+    size_t consumed = 0;
+
+    /* 4097 bytes header (exceeds PROTO_MAX_PAYLOAD_SIZE 4096) */
+    uint32_t len_4097 = htonl(4097);
+    memcpy(wire, &len_4097, 4);
+    int res = protocol_unpack_frame(wire, 4, out_payload, sizeof(out_payload), &out_len, &consumed);
+    TEST_ASSERT(res == PROTO_ERR_PAYLOAD_TOO_LARGE,
+                "Header declaring 4097 bytes rejected immediately with PROTO_ERR_PAYLOAD_TOO_LARGE");
+
+    /* 5000 bytes header */
+    uint32_t len_5000 = htonl(5000);
+    memcpy(wire, &len_5000, 4);
+    res = protocol_unpack_frame(wire, 4, out_payload, sizeof(out_payload), &out_len, &consumed);
+    TEST_ASSERT(res == PROTO_ERR_PAYLOAD_TOO_LARGE,
+                "Header declaring 5000 bytes rejected immediately with PROTO_ERR_PAYLOAD_TOO_LARGE");
+
+    /* 65536 bytes header */
+    uint32_t len_65536 = htonl(65536);
+    memcpy(wire, &len_65536, 4);
+    res = protocol_unpack_frame(wire, 4, out_payload, sizeof(out_payload), &out_len, &consumed);
+    TEST_ASSERT(res == PROTO_ERR_PAYLOAD_TOO_LARGE,
+                "Header declaring 65536 bytes rejected immediately with PROTO_ERR_PAYLOAD_TOO_LARGE");
+
+    /* Exactly 4096 bytes header: valid length, waiting for payload */
+    uint32_t len_4096 = htonl(4096);
+    memcpy(wire, &len_4096, 4);
+    res = protocol_unpack_frame(wire, 4, out_payload, sizeof(out_payload), &out_len, &consumed);
+    TEST_ASSERT(res == PROTO_NEED_MORE_DATA,
+                "Header declaring exactly 4096 bytes accepted as valid, returns PROTO_NEED_MORE_DATA");
+}
+
+/* Test 17: 3-token and 4-token ERR message parsing */
+static void test_parse_msg_err_formats(void) {
+    protocol_msg_t msg;
+
+    /* 3-token: ERR\t<code>\t<message>\n */
+    int res = protocol_parse_msg("ERR\t402\tInvalid move\n", 0, &msg);
+    TEST_ASSERT(res == PROTO_OK, "3-token ERR succeeds");
+    TEST_ASSERT(msg.cmd == CMD_ERR, "Parsed CMD_ERR");
+    TEST_ASSERT(msg.token_count == 3, "token_count is 3");
+    TEST_ASSERT(msg.request_id == 0, "request_id is 0 for 3-token ERR");
+    TEST_ASSERT(strcmp(msg.tokens[1], "402") == 0, "Error code is 402");
+    TEST_ASSERT(strcmp(msg.tokens[2], "Invalid move") == 0, "Error msg is 'Invalid move'");
+
+    /* 4-token: ERR\t<ref_id>\t<code>\t<message>\n */
+    res = protocol_parse_msg("ERR\t1001\t201\tAuthentication failed\n", 0, &msg);
+    TEST_ASSERT(res == PROTO_OK, "4-token ERR succeeds");
+    TEST_ASSERT(msg.cmd == CMD_ERR, "Parsed CMD_ERR");
+    TEST_ASSERT(msg.token_count == 4, "token_count is 4");
+    TEST_ASSERT(msg.request_id == 1001, "Parsed ref_id (request_id) == 1001");
+    TEST_ASSERT(strcmp(msg.tokens[2], "201") == 0, "Error code is 201");
+    TEST_ASSERT(strcmp(msg.tokens[3], "Authentication failed") == 0, "Error msg is 'Authentication failed'");
+}
+
 int main(void) {
     printf("=========================================\n");
     printf("   RUNNING PROTOCOL UNIT TESTS (T1H2)   \n");
@@ -238,6 +420,13 @@ int main(void) {
     test_unpack_gigantic_frame_rejected();
     test_parse_msg_various();
     test_helpers();
+    test_parse_msg_missing_tokens();
+    test_parse_msg_integer_overflow();
+    test_parse_msg_negative_numbers();
+    test_parse_msg_non_numeric();
+    test_parse_msg_out_of_range_coords();
+    test_unpack_oversized_payload_header();
+    test_parse_msg_err_formats();
 
     printf("=========================================\n");
     printf("   RESULTS: %d / %d tests passed\n", g_tests_passed, g_tests_run);

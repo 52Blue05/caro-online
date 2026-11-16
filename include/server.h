@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <time.h>
 
 #if defined(_WIN32)
     #include <winsock2.h>
@@ -42,6 +43,11 @@ extern "C" {
 #define SERVER_RX_BUFFER_SIZE    PROTO_MAX_FRAME_BUFFER
 #define SERVER_TX_BUFFER_SIZE    PROTO_MAX_FRAME_BUFFER
 
+/* Resource & Work Limits (R1) */
+#define SERVER_READ_BUDGET_BYTES    32768
+#define SERVER_FRAME_BUDGET         16
+#define SERVER_FRAME_TIMEOUT_SEC    10
+
 /* Client connection states */
 typedef enum {
     STATE_DISCONNECTED     = 0,
@@ -73,11 +79,16 @@ typedef struct {
     /* TX Buffer for outgoing framed data */
     uint8_t         tx_buf[PROTO_MAX_FRAME_BUFFER];
     size_t          tx_len;                     /* Current bytes queued in tx_buf */
+    size_t          tx_offset;                  /* Current bytes already sent in tx_buf (partial write tracking) */
+
+    /* Activity & Timeout */
+    time_t          last_active_ts;             /* Last activity timestamp for frame timeout detection */
 
     /* User identity & session state */
     uint32_t        client_id;                  /* Server slot / session sequential ID */
     uint32_t        user_id;                    /* Authenticated account ID (0 if guest) */
     char            username[32];               /* Logged in username */
+    bool            is_guest;                   /* True if guest session, false if registered account */
     uint32_t        current_game_id;            /* Active game ID (0 if none) */
 } client_conn_t;
 
@@ -179,6 +190,15 @@ int server_send_err(server_t *srv, int idx, int err_code, const char *reason);
 int server_handle_client_read(server_t *srv, int idx);
 
 /**
+ * @brief Process pending frames in client's user-space rx_buf up to SERVER_FRAME_BUDGET.
+ * 
+ * @param srv Pointer to server_t instance
+ * @param idx Client index
+ * @return 0 on success, negative on disconnect/error.
+ */
+int server_process_pending_frames(server_t *srv, int idx);
+
+/**
  * @brief Handle POLLOUT event on client socket (send queued tx_buf data non-blocking).
  * 
  * @param srv Pointer to server_t instance
@@ -197,6 +217,22 @@ int server_handle_client_write(server_t *srv, int idx);
  * @return 0 on success, negative on error.
  */
 int server_handle_client_payload(server_t *srv, int idx, const char *payload, size_t len);
+
+/**
+ * @brief Accept pending incoming TCP connections on listener socket non-blocking.
+ * 
+ * @param srv Pointer to server_t instance
+ * @return Number of accepted connections, or negative on error.
+ */
+int server_accept_new_client(server_t *srv);
+
+/**
+ * @brief Broadcast CMD_ONLINE_LIST to all active authenticated and lobby clients.
+ * 
+ * @param srv Pointer to server_t instance
+ * @return 0 on success, negative on error.
+ */
+int server_broadcast_online_list(server_t *srv);
 
 #ifdef __cplusplus
 }

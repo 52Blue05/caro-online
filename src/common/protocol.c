@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <errno.h>
 
 /* Command string mapping table */
 typedef struct {
@@ -147,7 +148,7 @@ int protocol_unpack_frame(const uint8_t *in_buf, size_t in_len,
     }
 
     /* Safety check against gigantic frames / denial of service */
-    if (payload_len > PROTO_MAX_FRAME_BUFFER) {
+    if (payload_len > PROTO_MAX_PAYLOAD_SIZE) {
         return PROTO_ERR_PAYLOAD_TOO_LARGE;
     }
 
@@ -237,12 +238,44 @@ int protocol_tokenize(const char *payload, size_t payload_len,
     return PROTO_OK;
 }
 
+/**
+ * @brief Strictly parses a non-negative integer string into uint32_t.
+ * 
+ * Rejects NULL, empty strings, non-digits (including negative sign and whitespace),
+ * integer overflow (ERANGE or > UINT32_MAX), and unparsed trailing characters.
+ */
+static bool parse_strict_uint32(const char *str, uint32_t *out_val) {
+    if (!str || *str == '\0') {
+        return false;
+    }
+    for (const char *p = str; *p != '\0'; p++) {
+        if (!isdigit((unsigned char)*p)) {
+            return false;
+        }
+    }
+    errno = 0;
+    char *endptr = NULL;
+    unsigned long long val = strtoull(str, &endptr, 10);
+    if (errno == ERANGE || endptr == str || *endptr != '\0') {
+        return false;
+    }
+    if (val > (unsigned long long)UINT32_MAX) {
+        return false;
+    }
+    if (out_val) {
+        *out_val = (uint32_t)val;
+    }
+    return true;
+}
+
 int protocol_parse_msg(const char *payload, size_t payload_len, protocol_msg_t *msg) {
     if (!payload || !msg) {
         return PROTO_ERR_INVALID_PARAM;
     }
 
     memset(msg, 0, sizeof(*msg));
+    msg->move_row = -1;
+    msg->move_col = -1;
 
     if (payload_len == 0) {
         payload_len = strlen(payload);
@@ -275,57 +308,112 @@ int protocol_parse_msg(const char *payload, size_t payload_len, protocol_msg_t *
     msg->cmd_str[tok0_len] = '\0';
     msg->cmd = protocol_cmd_from_str(msg->cmd_str);
 
-    /* Command-specific parsing of extended fields */
+    /* Command-specific parsing and strict validation of extended fields */
     switch (msg->cmd) {
-        case CMD_REGISTER:
+        case CMD_MOVE:
+        case CMD_MOVE_ACK:
+        case CMD_MOVE_BROADCAST: {
+            if (msg->token_count < 5) {
+                return PROTO_ERR_INVALID_PARAM;
+            }
+            if (!parse_strict_uint32(msg->tokens[1], &msg->game_id)) {
+                return PROTO_ERR_INVALID_PARAM;
+            }
+            if (!parse_strict_uint32(msg->tokens[2], &msg->seq)) {
+                return PROTO_ERR_INVALID_PARAM;
+            }
+            uint32_t r, c;
+            if (!parse_strict_uint32(msg->tokens[3], &r) || r > 14) {
+                return PROTO_ERR_INVALID_PARAM;
+            }
+            if (!parse_strict_uint32(msg->tokens[4], &c) || c > 14) {
+                return PROTO_ERR_INVALID_PARAM;
+            }
+            msg->move_row = (int)r;
+            msg->move_col = (int)c;
+            break;
+        }
+
         case CMD_LOGIN:
+        case CMD_REGISTER: {
+            if (msg->token_count < 4) {
+                return PROTO_ERR_INVALID_PARAM;
+            }
+            if (!parse_strict_uint32(msg->tokens[1], &msg->request_id)) {
+                return PROTO_ERR_INVALID_PARAM;
+            }
+            break;
+        }
+
+        case CMD_CHALLENGE: {
+            if (msg->token_count < 3) {
+                return PROTO_ERR_INVALID_PARAM;
+            }
+            if (!parse_strict_uint32(msg->tokens[1], &msg->request_id)) {
+                return PROTO_ERR_INVALID_PARAM;
+            }
+            break;
+        }
+
+        case CMD_ERR: {
+            if (msg->token_count < 3) {
+                return PROTO_ERR_INVALID_PARAM;
+            }
+            /* Format: ERR\t<code>\t<message> (3 tokens)
+             * or     ERR\t<ref_id>\t<code>\t<message> (>= 4 tokens) */
+            if (msg->token_count == 3) {
+                uint32_t code_val;
+                if (!parse_strict_uint32(msg->tokens[1], &code_val)) {
+                    return PROTO_ERR_INVALID_PARAM;
+                }
+                msg->request_id = 0;
+            } else {
+                uint32_t code_val;
+                if (!parse_strict_uint32(msg->tokens[1], &msg->request_id)) {
+                    return PROTO_ERR_INVALID_PARAM;
+                }
+                if (!parse_strict_uint32(msg->tokens[2], &code_val)) {
+                    return PROTO_ERR_INVALID_PARAM;
+                }
+            }
+            break;
+        }
+
         case CMD_OK:
-        case CMD_CHALLENGE:
         case CMD_GET_ONLINE:
         case CMD_ONLINE_LIST:
         case CMD_GET_LEADERBOARD:
-        case CMD_GET_GAME_LOG:
+        case CMD_GET_GAME_LOG: {
             if (msg->token_count >= 2) {
-                msg->request_id = (uint32_t)strtoul(msg->tokens[1], NULL, 10);
+                if (!parse_strict_uint32(msg->tokens[1], &msg->request_id)) {
+                    return PROTO_ERR_INVALID_PARAM;
+                }
             }
             break;
+        }
 
         case CMD_CHALLENGE_REQ:
-        case CMD_CHALLENGE_RESP:
+        case CMD_CHALLENGE_RESP: {
             if (msg->token_count >= 2) {
-                /* token 1 is invite_id */
-                msg->request_id = (uint32_t)strtoul(msg->tokens[1], NULL, 10);
+                if (!parse_strict_uint32(msg->tokens[1], &msg->request_id)) {
+                    return PROTO_ERR_INVALID_PARAM;
+                }
             }
             break;
+        }
 
         case CMD_GAME_START:
         case CMD_RESIGN:
         case CMD_OFFER_DRAW:
         case CMD_DRAW_RESP:
-        case CMD_GAME_OVER:
+        case CMD_GAME_OVER: {
             if (msg->token_count >= 2) {
-                msg->game_id = (uint32_t)strtoul(msg->tokens[1], NULL, 10);
+                if (!parse_strict_uint32(msg->tokens[1], &msg->game_id)) {
+                    return PROTO_ERR_INVALID_PARAM;
+                }
             }
             break;
-
-        case CMD_MOVE:
-        case CMD_MOVE_ACK:
-        case CMD_MOVE_BROADCAST:
-            if (msg->token_count >= 3) {
-                msg->game_id = (uint32_t)strtoul(msg->tokens[1], NULL, 10);
-                msg->seq = (uint32_t)strtoul(msg->tokens[2], NULL, 10);
-            }
-            break;
-
-        case CMD_ERR:
-            /* Format: ERR\t<code>\t<message> or ERR\t<ref_id>\t<code>\t<message> */
-            if (msg->token_count == 3) {
-                /* Code and message */
-                msg->request_id = 0;
-            } else if (msg->token_count >= 4) {
-                msg->request_id = (uint32_t)strtoul(msg->tokens[1], NULL, 10);
-            }
-            break;
+        }
 
         default:
             break;
