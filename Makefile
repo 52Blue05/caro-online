@@ -81,6 +81,7 @@ TEST_AUTH_OBJS := $(BUILD_DIR)/tests/test_auth.o \
                   $(BUILD_DIR)/server/storage.o
 
 .PHONY: all server client test test_game test_storage test_auth clean dirs
+.SECONDARY:
 
 all: dirs server client test test_auth
 

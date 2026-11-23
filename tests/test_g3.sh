@@ -53,6 +53,14 @@ echo "Server log        : $SERVER_LOG"
 echo "Timestamp         : $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 echo "================================================================="
 
+# Check if --invite-timeout was passed in arguments to export for server
+for ((i=1; i<=$#; i++)); do
+    if [ "${!i}" = "--invite-timeout" ]; then
+        next_i=$((i+1))
+        export CARO_INVITE_TIMEOUT="${!next_i}"
+    fi
+done
+
 # 1. Clean Stale Artifacts & Build Project Binaries
 echo "[*] Step 1: Cleaning stale database and logs, building binaries..."
 rm -f "$DB_FILE" "$DB_FILE-wal" "$DB_FILE-shm" "$SERVER_LOG"

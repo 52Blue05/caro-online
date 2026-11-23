@@ -64,7 +64,8 @@ typedef enum {
     STATE_UNAUTHENTICATED  = 1,
     STATE_AUTHENTICATED    = 2,
     STATE_IN_LOBBY         = 3,
-    STATE_IN_GAME          = 4
+    STATE_IN_INVITE        = 4,
+    STATE_IN_GAME          = 5
 } client_state_t;
 
 /* Backwards compatibility aliases */
@@ -73,7 +74,25 @@ typedef enum {
 #define CLIENT_STATE_GUEST          STATE_UNAUTHENTICATED
 #define CLIENT_STATE_AUTHENTICATED  STATE_AUTHENTICATED
 #define CLIENT_STATE_IN_LOBBY       STATE_IN_LOBBY
+#define CLIENT_STATE_IN_INVITE      STATE_IN_INVITE
 #define CLIENT_STATE_IN_GAME        STATE_IN_GAME
+
+/* Challenge invite constants and structures (F15) */
+#define SERVER_MAX_INVITES          32
+#define DEFAULT_INVITE_TIMEOUT_SEC  30
+
+typedef struct {
+    uint32_t        invite_id;          /* Monotonic ID (>0) */
+    uint32_t        req_id;             /* Challenger request_id for ERR 302 */
+    int             challenger_idx;     /* Slot in srv->clients */
+    uint32_t        challenger_gen;     /* Generation counter of challenger */
+    int             target_idx;         /* Slot of target in srv->clients */
+    uint32_t        target_gen;         /* Generation counter of target */
+    time_t          created_at;         /* When invite was created */
+    time_t          expires_at;         /* When invite expires */
+    int64_t         expires_at_ms;      /* Monotonic timestamp in ms for expiration */
+    bool            active;             /* Slot currently in use */
+} challenge_invite_t;
 
 /* Per-client connection context */
 typedef struct {
@@ -101,6 +120,7 @@ typedef struct {
     char            username[32];               /* Logged in username */
     bool            is_guest;                   /* True if guest session, false if registered account */
     uint32_t        current_game_id;            /* Active game ID (0 if none) */
+    uint32_t        pending_invite_id;          /* Active invite ID if STATE_IN_INVITE (0 if none) */
 } client_conn_t;
 
 /* Database Worker Request / Response Types */
@@ -139,6 +159,7 @@ typedef struct {
     int             wins;
     int             draws;
     int             losses;
+    uint32_t        game_id;        /* Game ID for settlement response */
 } db_response_t;
 
 /* Per-user authentication throttling entry */
@@ -148,6 +169,19 @@ typedef struct {
     time_t          lockout_until;
     time_t          last_attempt_ts;
 } auth_throttle_entry_t;
+
+/* Active match management slot (F16-F20) */
+typedef struct {
+    game_t          game;               /* Pure Caro game engine instance */
+    bool            active;             /* True if slot currently contains an ongoing match */
+    bool            settled;            /* True if match has been concluded (idempotency flag) */
+    int             player_x_idx;       /* Client slot index for Player X */
+    int             player_o_idx;       /* Client slot index for Player O */
+    uint32_t        player_x_gen;       /* Client generation for Player X */
+    uint32_t        player_o_gen;       /* Client generation for Player O */
+    caro_cell_t     draw_offered_by;    /* CELL_EMPTY, CELL_X, or CELL_O */
+    time_t          start_time;         /* Match start timestamp */
+} game_slot_t;
 
 /* Server master structure */
 typedef struct {
@@ -188,6 +222,17 @@ typedef struct {
 
     /* Auth throttle table */
     auth_throttle_entry_t throttle_table[MAX_AUTH_THROTTLE_ENTRIES];
+
+    /* Challenge invites tracking (F15) */
+    challenge_invite_t  invites[SERVER_MAX_INVITES];
+    uint32_t            next_invite_id;
+    int                 invite_timeout_sec;
+    int64_t             invite_timeout_ms;
+
+    /* Match tracking (F16-F20) */
+    game_slot_t         games[CARO_MAX_GAMES];
+    size_t              active_games_count;
+    uint32_t            next_game_id;
 } server_t;
 
 /**
@@ -305,6 +350,26 @@ int server_accept_new_client(server_t *srv);
  * @brief Broadcast CMD_ONLINE_LIST to all active authenticated and lobby clients.
  */
 int server_broadcast_online_list(server_t *srv);
+
+/* Challenge & Invitation Management (F15) */
+int challenge_create(server_t *srv, int challenger_idx, const char *target_name, uint32_t req_id);
+int challenge_respond(server_t *srv, int responder_idx, uint32_t invite_id, bool accept);
+void challenge_check_timeouts(server_t *srv);
+void challenge_handle_disconnect(server_t *srv, int client_idx);
+
+/* Game Management Functions (F16-F20) */
+game_slot_t *server_find_game(server_t *srv, uint32_t game_id);
+int server_find_free_game_slot(server_t *srv);
+int game_manager_start(server_t *srv, int challenger_idx, int target_idx);
+int game_manager_handle_move(server_t *srv, int client_idx, uint32_t game_id, uint32_t seq, int row, int col);
+int game_manager_conclude(server_t *srv, uint32_t game_id, const char *outcome, const char *reason,
+                          int winner_idx, int loser_idx, bool is_draw);
+void game_manager_handle_disconnect(server_t *srv, int disconnected_idx);
+
+/* Per-game structured logging (F20) */
+int game_log_init(uint32_t game_id, const char *pX_name, uint32_t pX_id, const char *pO_name, uint32_t pO_id);
+int game_log_move(uint32_t game_id, uint32_t seq, const char *stone, uint32_t user_id, const char *username, int row, int col);
+int game_log_conclude(uint32_t game_id, const char *outcome, const char *reason, uint32_t winner_id, const char *winner_name, uint32_t total_moves);
 
 #ifdef __cplusplus
 }

@@ -21,35 +21,49 @@ caro-online/
 ├── Makefile                    # Hệ thống build tự động chuẩn POSIX C11 (GCC)
 ├── .gitignore                  # Bỏ qua binary, object, db, logs, agent state
 ├── README.md                   # Tài liệu tổng quan và hướng dẫn build/chạy/test
-├── bin/                        # File thực thi (caro_server, caro_client, test_protocol, test_game)
+├── bin/                        # File thực thi (caro_server, caro_client, test_protocol, test_game, test_storage, test_auth)
 ├── build/                      # Intermediate object files (*.o)
+├── schema.sql                  # Schema cơ sở dữ liệu SQLite (users, games, moves)
 ├── include/                    # Header files công khai
 │   ├── protocol.h              # Giao thức framing nhị phân 4 byte, strict parser và struct thông điệp
-│   ├── server.h                # Cấu trúc server, client context, RX/TX buffers, quotas & timeouts
-│   └── game.h                  # Bàn cờ 15x15 Gomoku, trạng thái ô, luật thắng >= 5 quân, overline & hòa
+│   ├── server.h                # Cấu trúc server, client context, RX/TX buffers, challenge/game manager
+│   ├── game.h                  # Bàn cờ 15x15 Gomoku, trạng thái ô, luật thắng >= 5 quân, overline & hòa
+│   ├── storage.h               # Giao diện lưu trữ SQLite, quản lý tài khoản, trận đấu và nước đi
+│   ├── auth.h                  # Giao diện băm mật khẩu có muối (salt) và kiểm tra xác thực
+│   └── sha256.h                # Module mã hóa SHA-256 độc lập chuẩn FIPS 180-4
 ├── src/                        # Mã nguồn C
 │   ├── common/                 # Module dùng chung
-│   │   └── protocol.c          # Đóng gói, unpack khung, strict parser số và phân tách TAB
+│   │   ├── protocol.c          # Đóng gói, unpack khung, strict parser số và phân tách TAB
+│   │   └── sha256.c            # Hiện thực SHA-256 thuần C11 không phụ thuộc thư viện ngoài
 │   ├── server/                 # Module Server
 │   │   ├── main.c              # Server CLI entry point và xử lý tín hiệu SIGINT/SIGTERM
-│   │   ├── server.c            # Event loop poll() non-blocking, RX/TX quotas, dọn dẹp FD an toàn
-│   │   └── game.c              # Thuật toán luật cờ Caro Gomoku 15x15 độc lập 100% với mạng/SQL
+│   │   ├── server.c            # Event loop poll() non-blocking, RX/TX quotas, quản lý thách đấu & trận đấu
+│   │   ├── game.c              # Thuật toán luật cờ Caro Gomoku 15x15 độc lập 100% với mạng/SQL
+│   │   ├── storage.c           # Truy vấn SQLite bằng Prepared Statements, khôi phục crash an toàn
+│   │   └── auth.c              # Sinh salt ngẫu nhiên 16 bytes, băm mật khẩu và so sánh constant-time
 │   └── client/                 # Module Client CLI
-│       └── main.c              # Client CLI đa kênh poll() giữa stdin và socket, in lỗi và mất kết nối
+│       └── main.c              # Client CLI đa kênh poll() với 13 lệnh tương tác và bàn cờ ASCII 15x15
 ├── tests/                      # Kiểm thử đơn vị, đối kháng và tích hợp
-│   ├── test_protocol.c         # Bộ 73 unit tests kiểm tra giao thức & parser
+│   ├── test_protocol.c         # Bộ 109 unit tests kiểm tra giao thức & parser
 │   ├── test_game.c             # Bộ 134 unit tests kiểm tra luật cờ Caro 15x15 độc lập
+│   ├── test_storage.c          # Bộ 113 unit tests kiểm tra SQLite và phục hồi dữ liệu
+│   ├── test_auth.c             # Bộ 52 unit tests kiểm tra SHA-256, salt và constant-time verification
+│   ├── test_g3_suite.py        # Kịch bản E2E kiểm tra xác thực, thách đấu và 4 client chơi 2 trận
+│   ├── test_g3.sh              # Script shell chạy trọn gói nghiệm thu Mốc G3
+│   ├── test_g3_results.log     # Nhật ký kết quả kiểm thử thực tế mốc G3
 │   ├── test_g2_suite.py        # Kịch bản E2E kiểm tra tải 20 kết nối, framing biên và rò rỉ FD
 │   ├── test_g2.sh              # Script shell chạy trọn gói nghiệm thu Mốc G2
 │   ├── test_g2_results.log     # Nhật ký kết quả kiểm thử thực tế mốc G2
 │   ├── test_integration_g1.py  # Kịch bản kiểm thử tích hợp mốc G1
 │   └── test_integration_g1.sh  # Script shell chạy trọn gói nghiệm thu Mốc G1
+├── logs/                       # Thư mục lưu file log chi tiết từng trận cờ (logs/game_<id>.log)
 └── docs/                       # Tài liệu thiết kế kiến trúc, ca sử dụng, giao thức, tiến độ
     ├── architecture.md         # Kiến trúc hệ thống và luồng dữ liệu
     ├── protocol.md             # Đặc tả giao thức tầng ứng dụng
     ├── use_cases.md            # Đặc tả 22 ca sử dụng toàn dự án
     ├── progress_week1.md       # Báo cáo tiến độ và bằng chứng kiểm thử Tuần 1 (Mốc G1)
-    └── progress_week2.md       # Báo cáo tiến độ và bằng chứng kiểm thử Tuần 2 (Mốc G2)
+    ├── progress_week2.md       # Báo cáo tiến độ và bằng chứng kiểm thử Tuần 2 (Mốc G2)
+    └── progress_week3.md       # Báo cáo tiến độ và bằng chứng kiểm thử Tuần 3 (Mốc G3)
 ```
 
 ---
@@ -195,3 +209,55 @@ bash tests/test_g2.sh
 make test_game
 ```
 Chi tiết xem tại tài liệu nghiệm thu: [`docs/progress_week2.md`](docs/progress_week2.md).
+
+---
+
+## 9. Báo Cáo Tiến Độ Tuần 3 (Đạt Mốc Nghiệm Thu G3)
+
+Toàn bộ 8/8 đầu việc theo kế hoạch Tuần 3 đã hoàn thành xuất sắc 100%, vượt qua tất cả 408 C unit tests và 28/28 kịch bản E2E kiểm định:
+- [x] **T3N1**: Thiết kế Schema SQLite (`schema.sql`) với `users`, `games`, `moves`, ràng buộc ID, seq và API lưu trữ (`include/storage.h`, `src/server/storage.c`) (113/113 tests pass).
+- [x] **T3N2**: Hiện thực băm mật khẩu SHA-256 + 16-byte random salt, so sánh constant-time và hàng đợi luồng ngầm Async DB Worker Queue giao tiếp qua self-pipe (52/52 tests pass).
+- [x] **T3N3**: Kiểm soát phiên đơn (Single active session), chống brute-force khóa 30s sau 5 lần sai, bảo vệ race condition tái sử dụng FD bằng số thế hệ `generation` counter.
+- [x] **T3N4**: Tích hợp xác thực vào luồng chơi (chỉ tài khoản đăng nhập mới được thách đấu/chơi), ghi nhận nhật ký hiện diện `[PRESENCE]`.
+- [x] **T3H1**: Cơ chế thách đấu thời gian thực (`CHALLENGE`, `ACCEPT`, `DECLINE`), khóa 2 chiều người chơi, quét timeout tự hủy sau 30 giây (`ERR 302`), từ chối người chơi đang bận (`ERR 301`).
+- [x] **T3H2**: Quản lý ván cờ độc lập trong RAM (`game_slot_t`), kiểm duyệt nước đi 6 bước chặt chẽ trên Server (state, player, turn, seq, bounds, vacancy), phản hồi `MOVE_ACK` và `MOVE_BROADCAST`.
+- [x] **T3H3**: Xử lý đầy đủ các kết cục trận đấu (Thắng 5 quân liên tiếp, Hòa, Đầu hàng `RESIGN`, Rớt mạng forfeit) và chốt trạng thái một lần duy nhất trong RAM (*idempotency*).
+- [x] **T3H4**: Kiểm thử 4 tài khoản chơi 2 trận song song không rò rỉ sự kiện (`TC-T4-01`), ghi log chi tiết từng trận cờ (`logs/game_<id>.log`), nâng cấp Client CLI tương tác với 13 lệnh và bàn cờ ASCII 15x15.
+
+### Lệnh chạy kiểm thử nghiệm thu Mốc G3:
+```bash
+# 1. Chạy trọn gói bộ 28 kịch bản kiểm thử E2E Tuần 3:
+bash tests/test_g3.sh --invite-timeout 1.0
+
+# 2. Chạy tự kiểm thử Client CLI:
+./bin/caro_client --test
+
+# 3. Chạy toàn bộ 408 Unit Tests (Protocol, Rules, Storage, Auth):
+make test
+```
+
+### Hướng dẫn Chơi thử Cờ Caro Trực tiếp qua CLI:
+1. **Khởi động Server**:
+   ```bash
+   ./bin/caro_server -p 8888
+   ```
+2. **Khởi động Client 1 (Alice)**:
+   ```bash
+   ./bin/caro_client 127.0.0.1 8888
+   REGISTER alice pass123
+   LOGIN alice pass123
+   CHALLENGE bob
+   ```
+3. **Khởi động Client 2 (Bob)**:
+   ```bash
+   ./bin/caro_client 127.0.0.1 8888
+   REGISTER bob pass456
+   LOGIN bob pass456
+   ACCEPT 1
+   ```
+4. **Đánh cờ**:
+   - Alice (quân X): `MOVE 7 7`
+   - Bob (quân O): `MOVE 7 8`
+   - Bàn cờ ASCII 15x15 cập nhật theo thời gian thực trên cả 2 màn hình!
+
+Chi tiết xem tại tài liệu nghiệm thu: [`docs/progress_week3.md`](docs/progress_week3.md).

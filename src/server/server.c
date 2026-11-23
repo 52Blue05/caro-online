@@ -20,6 +20,24 @@
     #include <poll.h>
 #endif
 
+#include <sys/stat.h>
+#if defined(_WIN32)
+    #include <direct.h>
+    #define caro_mkdir(p) _mkdir(p)
+#else
+    #define caro_mkdir(p) mkdir(p, 0755)
+#endif
+
+static int64_t current_time_ms(void) {
+#if defined(_WIN32)
+    return (int64_t)GetTickCount64();
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + (ts.tv_nsec / 1000000);
+#endif
+}
+
 /* ------------------------------------------------------------------------- */
 /* Pipe Helpers (POSIX pipe on Linux, Loopback TCP Pair on Windows)          */
 /* ------------------------------------------------------------------------- */
@@ -179,6 +197,7 @@ static void *db_worker_thread_func(void *arg) {
         resp.client_idx = req.client_idx;
         resp.generation = req.generation;
         resp.type = req.type;
+        resp.game_id = req.game_id;
         resp.status_code = -1;
 
         if (req.type == DB_REQ_REGISTER) {
@@ -290,6 +309,14 @@ void server_handle_db_responses(server_t *srv) {
     /* Process batch on main event loop thread */
     for (int b = 0; b < batch_count; ++b) {
         const db_response_t *resp = &batch[b];
+
+        /* Asynchronous game settlement completion */
+        if (resp->type == DB_REQ_SETTLE_GAME) {
+            printf("[DB] Settlement committed for game %u (status=%d)\n",
+                   resp->game_id, resp->status_code);
+            continue;
+        }
+
         int idx = resp->client_idx;
         if (idx < 0 || idx >= SERVER_MAX_CLIENTS) continue;
 
@@ -341,6 +368,7 @@ void server_handle_db_responses(server_t *srv) {
                 if (i != idx && srv->clients[i].fd >= 0 &&
                     (srv->clients[i].state == STATE_AUTHENTICATED ||
                      srv->clients[i].state == STATE_IN_LOBBY ||
+                     srv->clients[i].state == STATE_IN_INVITE ||
                      srv->clients[i].state == STATE_IN_GAME)) {
                     if (srv->clients[i].user_id == resp->user_id ||
                         strcasecmp(srv->clients[i].username, resp->username) == 0) {
@@ -418,7 +446,28 @@ int server_init(server_t *srv, const char *host, int port, const char *db_path) 
         srv->clients[i].fd = -1;
         srv->clients[i].state = STATE_DISCONNECTED;
         srv->clients[i].generation = 1;
+        srv->clients[i].pending_invite_id = 0;
     }
+
+    /* Milestone 4: Initialize challenge invites and games */
+    srv->next_invite_id = 1;
+    srv->invite_timeout_sec = DEFAULT_INVITE_TIMEOUT_SEC;
+    srv->invite_timeout_ms = (int64_t)DEFAULT_INVITE_TIMEOUT_SEC * 1000;
+    const char *env_to = getenv("CARO_INVITE_TIMEOUT");
+    if (env_to && *env_to) {
+        double val = atof(env_to);
+        if (val > 0.0) {
+            srv->invite_timeout_sec = (val < 1.0) ? 1 : (int)val;
+            srv->invite_timeout_ms = (int64_t)(val * 1000.0);
+            if (srv->invite_timeout_ms <= 1000 && srv->invite_timeout_ms > 200) {
+                srv->invite_timeout_ms -= 100;
+            }
+        }
+    }
+    memset(srv->invites, 0, sizeof(srv->invites));
+    memset(srv->games, 0, sizeof(srv->games));
+    srv->active_games_count = 0;
+    srv->next_game_id = 1;
 
 #if defined(_WIN32)
     WSADATA wsa;
@@ -534,6 +583,8 @@ int server_broadcast_online_list(server_t *srv) {
             const char *st_str = "IDLE";
             if (srv->clients[i].state == STATE_IN_GAME) {
                 st_str = "IN_GAME";
+            } else if (srv->clients[i].state == STATE_IN_INVITE) {
+                st_str = "BUSY";
             } else if (srv->clients[i].state == STATE_IN_LOBBY) {
                 st_str = "LOBBY";
             }
@@ -552,15 +603,670 @@ int server_broadcast_online_list(server_t *srv) {
         return -1;
     }
 
-    /* Push presence list to clients active in lobby or authenticated */
+    /* Push presence list to clients active in lobby, authenticated, or in invite */
     for (int i = 0; i < SERVER_MAX_CLIENTS; ++i) {
         if (srv->clients[i].fd >= 0 &&
-            (srv->clients[i].state == STATE_AUTHENTICATED || srv->clients[i].state == STATE_IN_LOBBY)) {
+            (srv->clients[i].state == STATE_AUTHENTICATED ||
+             srv->clients[i].state == STATE_IN_LOBBY ||
+             srv->clients[i].state == STATE_IN_INVITE)) {
             server_queue_send(srv, i, frame_buf, frame_len);
         }
     }
 
     return 0;
+}
+
+/* ========================================================================= */
+/* Structured Per-Game Logging Routines (F20)                               */
+/* ========================================================================= */
+
+int game_log_init(uint32_t game_id, const char *pX_name, uint32_t pX_id,
+                  const char *pO_name, uint32_t pO_id) {
+    caro_mkdir("logs");
+    char path[128];
+    snprintf(path, sizeof(path), "logs/game_%u.log", game_id);
+    FILE *f = fopen(path, "w");
+    if (!f) return -1;
+
+    time_t now = time(NULL);
+    char ts[64];
+    struct tm tm_buf;
+#if defined(_WIN32)
+    localtime_s(&tm_buf, &now);
+#else
+    localtime_r(&now, &tm_buf);
+#endif
+    strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tm_buf);
+
+    fprintf(f, "============================================================\n");
+    fprintf(f, "CARO (GOMOKU 15x15) MATCH LOG\n");
+    fprintf(f, "============================================================\n");
+    fprintf(f, "Match ID   : %u\n", game_id);
+    fprintf(f, "Start Time : %s\n", ts);
+    fprintf(f, "Player X   : %s (ID: %u)\n", pX_name ? pX_name : "Unknown", pX_id);
+    fprintf(f, "Player O   : %s (ID: %u)\n", pO_name ? pO_name : "Unknown", pO_id);
+    fprintf(f, "------------------------------------------------------------\n");
+    fprintf(f, "Seq   Timestamp            Player  Username         Coords\n");
+    fprintf(f, "------------------------------------------------------------\n");
+    fflush(f);
+    fclose(f);
+    return 0;
+}
+
+int game_log_move(uint32_t game_id, uint32_t seq, const char *stone,
+                  uint32_t user_id, const char *username, int row, int col) {
+    (void)user_id;
+    char path[128];
+    snprintf(path, sizeof(path), "logs/game_%u.log", game_id);
+    FILE *f = fopen(path, "a");
+    if (!f) return -1;
+
+    time_t now = time(NULL);
+    char ts[64];
+    struct tm tm_buf;
+#if defined(_WIN32)
+    localtime_s(&tm_buf, &now);
+#else
+    localtime_r(&now, &tm_buf);
+#endif
+    strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tm_buf);
+
+    fprintf(f, "%03u   %s  %-6s  %-16s (%2d, %2d)\n",
+            seq, ts, stone ? stone : "?", username ? username : "Anon", row, col);
+    fflush(f);
+    fclose(f);
+    return 0;
+}
+
+int game_log_conclude(uint32_t game_id, const char *outcome, const char *reason,
+                      uint32_t winner_id, const char *winner_name, uint32_t total_moves) {
+    char path[128];
+    snprintf(path, sizeof(path), "logs/game_%u.log", game_id);
+    FILE *f = fopen(path, "a");
+    if (!f) return -1;
+
+    time_t now = time(NULL);
+    char ts[64];
+    struct tm tm_buf;
+#if defined(_WIN32)
+    localtime_s(&tm_buf, &now);
+#else
+    localtime_r(&now, &tm_buf);
+#endif
+    strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tm_buf);
+
+    fprintf(f, "------------------------------------------------------------\n");
+    fprintf(f, "MATCH CONCLUSION\n");
+    fprintf(f, "------------------------------------------------------------\n");
+    fprintf(f, "End Time   : %s\n", ts);
+    fprintf(f, "Outcome    : %s\n", outcome ? outcome : "UNKNOWN");
+    fprintf(f, "Reason     : %s\n", reason ? reason : "UNKNOWN");
+    if (winner_id > 0) {
+        fprintf(f, "Winner     : %s (ID: %u)\n", winner_name ? winner_name : "Unknown", winner_id);
+    } else {
+        fprintf(f, "Winner     : None (Draw)\n");
+    }
+    fprintf(f, "Total Moves: %u\n", total_moves);
+    fprintf(f, "============================================================\n");
+    fflush(f);
+    fclose(f);
+    return 0;
+}
+
+/* ========================================================================= */
+/* Active Match Management & Rules Integration (F16-F20)                     */
+/* ========================================================================= */
+
+game_slot_t *server_find_game(server_t *srv, uint32_t game_id) {
+    if (!srv || game_id == 0) return NULL;
+    for (size_t i = 0; i < CARO_MAX_GAMES; ++i) {
+        if (srv->games[i].active && srv->games[i].game.game_id == game_id) {
+            return &srv->games[i];
+        }
+    }
+    return NULL;
+}
+
+int server_find_free_game_slot(server_t *srv) {
+    if (!srv) return -1;
+    for (int i = 0; i < CARO_MAX_GAMES; ++i) {
+        if (!srv->games[i].active) return i;
+    }
+    return -1;
+}
+
+int game_manager_conclude(server_t *srv, uint32_t game_id, const char *outcome,
+                          const char *reason, int winner_idx, int loser_idx, bool is_draw) {
+    if (!srv || game_id == 0) return -1;
+
+    game_slot_t *slot = NULL;
+    for (int i = 0; i < CARO_MAX_GAMES; ++i) {
+        if (srv->games[i].active && srv->games[i].game.game_id == game_id) {
+            slot = &srv->games[i];
+            break;
+        }
+    }
+    if (!slot) return -1;
+
+    /* 1. Idempotency guard: ensure conclusion executes exactly once per match */
+    if (slot->settled) {
+        printf("[*] Game %u already settled (idempotent no-op)\n", game_id);
+        return 0;
+    }
+    slot->settled = true;
+    slot->game.status = GAME_STATUS_FINISHED;
+
+    /* 2. Resolve winner and loser IDs and names */
+    uint32_t winner_uid = 0;
+    uint32_t loser_uid = 0;
+    const char *winner_name = "NONE";
+
+    if (!is_draw) {
+        if (winner_idx >= 0 && winner_idx < SERVER_MAX_CLIENTS) {
+            winner_uid = srv->clients[winner_idx].user_id;
+            winner_name = srv->clients[winner_idx].username;
+        } else if (winner_idx == slot->player_x_idx) {
+            winner_uid = slot->game.player_x_id;
+            winner_name = slot->game.player_x_name;
+        } else {
+            winner_uid = slot->game.player_o_id;
+            winner_name = slot->game.player_o_name;
+        }
+
+        if (loser_idx >= 0 && loser_idx < SERVER_MAX_CLIENTS) {
+            loser_uid = srv->clients[loser_idx].user_id;
+        } else if (winner_uid == slot->game.player_x_id) {
+            loser_uid = slot->game.player_o_id;
+        } else {
+            loser_uid = slot->game.player_x_id;
+        }
+    }
+
+    /* 3. Log match conclusion to logs/game_<game_id>.log (F20) */
+    game_log_conclude(game_id, outcome, reason, winner_uid, winner_name, slot->game.move_count);
+
+    /* 4. Format and broadcast GAME_OVER wire frame */
+    char go_payload[256];
+    snprintf(go_payload, sizeof(go_payload), "GAME_OVER\t%u\t%s\t%s\t%s\n",
+             game_id, outcome ? outcome : "UNKNOWN", winner_name, reason ? reason : "UNKNOWN");
+
+    uint8_t frame_buf[512];
+    size_t frame_len = 0;
+    protocol_pack_frame(go_payload, strlen(go_payload), frame_buf, sizeof(frame_buf), &frame_len);
+
+    /* Push to Player X if valid and generation matches */
+    int px = slot->player_x_idx;
+    if (px >= 0 && px < SERVER_MAX_CLIENTS) {
+        client_conn_t *cx = &srv->clients[px];
+        if (cx->fd >= 0 && cx->state != STATE_DISCONNECTED && cx->generation == slot->player_x_gen) {
+            server_queue_send(srv, px, frame_buf, frame_len);
+            cx->current_game_id = 0;
+            cx->state = STATE_IN_LOBBY;
+        }
+    }
+
+    /* Push to Player O if valid and generation matches */
+    int po = slot->player_o_idx;
+    if (po >= 0 && po < SERVER_MAX_CLIENTS) {
+        client_conn_t *co = &srv->clients[po];
+        if (co->fd >= 0 && co->state != STATE_DISCONNECTED && co->generation == slot->player_o_gen) {
+            server_queue_send(srv, po, frame_buf, frame_len);
+            co->current_game_id = 0;
+            co->state = STATE_IN_LOBBY;
+        }
+    }
+
+    /* 5. Enqueue asynchronous DB settlement job */
+    db_request_t req;
+    memset(&req, 0, sizeof(req));
+    req.req_id = game_id;
+    req.type = DB_REQ_SETTLE_GAME;
+    req.client_idx = (winner_idx >= 0) ? winner_idx : -1;
+    req.generation = (winner_idx >= 0 && winner_idx < SERVER_MAX_CLIENTS) ? srv->clients[winner_idx].generation : 0;
+    req.game_id = game_id;
+    req.winner_id = is_draw ? 0 : winner_uid;
+    req.loser_id = is_draw ? 0 : loser_uid;
+    req.is_draw = is_draw;
+    snprintf(req.outcome, sizeof(req.outcome), "%s", outcome ? outcome : "");
+    snprintf(req.reason, sizeof(req.reason), "%s", reason ? reason : "");
+    server_queue_db_request(srv, &req);
+
+    /* 6. Recycle game slot */
+    slot->active = false;
+    if (srv->active_games_count > 0) {
+        srv->active_games_count--;
+    }
+
+    printf("[GAME] Match concluded: game_id=%u | outcome=%s reason=%s winner=%s\n",
+           game_id, outcome ? outcome : "", reason ? reason : "", winner_name);
+
+    /* 7. Broadcast updated online list to restore players as available in lobby */
+    server_broadcast_online_list(srv);
+    return 0;
+}
+
+void game_manager_handle_disconnect(server_t *srv, int disconnected_idx) {
+    if (!srv || disconnected_idx < 0 || disconnected_idx >= SERVER_MAX_CLIENTS) return;
+    client_conn_t *c = &srv->clients[disconnected_idx];
+    if (c->current_game_id == 0) return;
+
+    uint32_t gid = c->current_game_id;
+    game_slot_t *slot = NULL;
+    for (int i = 0; i < CARO_MAX_GAMES; ++i) {
+        if (srv->games[i].active && srv->games[i].game.game_id == gid) {
+            slot = &srv->games[i];
+            break;
+        }
+    }
+    if (!slot || slot->settled) return;
+
+    int winner_idx = -1;
+    int loser_idx = disconnected_idx;
+    if (disconnected_idx == slot->player_x_idx) {
+        winner_idx = slot->player_o_idx;
+    } else if (disconnected_idx == slot->player_o_idx) {
+        winner_idx = slot->player_x_idx;
+    } else {
+        return;
+    }
+
+    printf("[GAME] Disconnect forfeit in game %u: slot %d left -> slot %d wins\n",
+           gid, disconnected_idx, winner_idx);
+
+    game_manager_conclude(srv, gid, "DISCONNECT", "DISCONNECT", winner_idx, loser_idx, false);
+}
+
+int game_manager_start(server_t *srv, int challenger_idx, int target_idx) {
+    if (!srv || challenger_idx < 0 || target_idx < 0 ||
+        challenger_idx >= SERVER_MAX_CLIENTS || target_idx >= SERVER_MAX_CLIENTS) {
+        return -1;
+    }
+    int slot_idx = server_find_free_game_slot(srv);
+    if (slot_idx < 0) {
+        fprintf(stderr, "[-] No free game slots available (max %d)\n", CARO_MAX_GAMES);
+        server_send_err_ref(srv, challenger_idx, 0, ERR_INTERNAL_SERVER, "Server game capacity reached");
+        server_send_err_ref(srv, target_idx, 0, ERR_INTERNAL_SERVER, "Server game capacity reached");
+        srv->clients[challenger_idx].state = STATE_IN_LOBBY;
+        srv->clients[target_idx].state = STATE_IN_LOBBY;
+        return -1;
+    }
+
+    client_conn_t *cX = &srv->clients[challenger_idx];
+    client_conn_t *cO = &srv->clients[target_idx];
+
+    /* Assign Game ID via storage or monotonically increasing counter */
+    uint32_t gid = 0;
+    if (cX->user_id > 0 && cO->user_id > 0 && cX->user_id != cO->user_id) {
+        storage_create_game(cX->user_id, cO->user_id, &gid);
+    }
+    if (gid == 0) {
+        gid = srv->next_game_id++;
+        if (gid == 0) gid = srv->next_game_id++;
+    }
+
+    game_slot_t *slot = &srv->games[slot_idx];
+    memset(slot, 0, sizeof(*slot));
+    game_init(&slot->game, gid, cX->fd, cO->fd, cX->user_id, cO->user_id);
+
+    slot->active = true;
+    slot->settled = false;
+    slot->player_x_idx = challenger_idx;
+    slot->player_o_idx = target_idx;
+    slot->player_x_gen = cX->generation;
+    slot->player_o_gen = cO->generation;
+    slot->draw_offered_by = CELL_EMPTY;
+    slot->start_time = time(NULL);
+    strncpy(slot->game.player_x_name, cX->username, sizeof(slot->game.player_x_name) - 1);
+    slot->game.player_x_name[sizeof(slot->game.player_x_name) - 1] = '\0';
+    strncpy(slot->game.player_o_name, cO->username, sizeof(slot->game.player_o_name) - 1);
+    slot->game.player_o_name[sizeof(slot->game.player_o_name) - 1] = '\0';
+
+    cX->state = STATE_IN_GAME;
+    cX->current_game_id = gid;
+    cX->pending_invite_id = 0;
+
+    cO->state = STATE_IN_GAME;
+    cO->current_game_id = gid;
+    cO->pending_invite_id = 0;
+
+    srv->active_games_count++;
+
+    /* Send GAME_START to challenger (X) and target (O) */
+    char start_payload[PROTO_MAX_PAYLOAD_SIZE];
+    uint8_t frame_buf[PROTO_MAX_FRAME_BUFFER];
+    size_t frame_len = 0;
+
+    /* To Challenger: GAME_START\t<game_id>\tX\t<target_username>\n */
+    snprintf(start_payload, sizeof(start_payload), "GAME_START\t%u\tX\t%s\n", gid, cO->username);
+    if (protocol_pack_frame(start_payload, strlen(start_payload), frame_buf, sizeof(frame_buf), &frame_len) == PROTO_OK) {
+        server_queue_send(srv, challenger_idx, frame_buf, frame_len);
+    }
+
+    /* To Target: GAME_START\t<game_id>\tO\t<challenger_username>\n */
+    snprintf(start_payload, sizeof(start_payload), "GAME_START\t%u\tO\t%s\n", gid, cX->username);
+    if (protocol_pack_frame(start_payload, strlen(start_payload), frame_buf, sizeof(frame_buf), &frame_len) == PROTO_OK) {
+        server_queue_send(srv, target_idx, frame_buf, frame_len);
+    }
+
+    /* Initialize log file (F20) */
+    game_log_init(gid, cX->username, cX->user_id, cO->username, cO->user_id);
+
+    printf("[GAME] Match started: game_id=%u | P1 '%s' (X, slot %d) vs P2 '%s' (O, slot %d)\n",
+           gid, cX->username, challenger_idx, cO->username, target_idx);
+
+    server_broadcast_online_list(srv);
+    return 0;
+}
+
+int game_manager_handle_move(server_t *srv, int idx, uint32_t game_id, uint32_t seq, int row, int col) {
+    if (!srv || idx < 0 || idx >= SERVER_MAX_CLIENTS) return -1;
+    client_conn_t *c = &srv->clients[idx];
+
+    /* Step 1: Session state validation */
+    if (c->state != STATE_IN_GAME || c->current_game_id != game_id) {
+        return server_send_err_ref(srv, idx, game_id, ERR_NOT_IN_GAME, "Not currently in this game");
+    }
+
+    game_slot_t *slot = server_find_game(srv, game_id);
+    if (!slot || !slot->active || slot->settled || slot->game.status != GAME_STATUS_IN_PROGRESS) {
+        return server_send_err_ref(srv, idx, game_id, ERR_NOT_IN_GAME, "Game not found or finished");
+    }
+
+    /* Step 2: Game membership check */
+    bool is_x = (slot->player_x_idx == idx && slot->player_x_gen == c->generation);
+    bool is_o = (slot->player_o_idx == idx && slot->player_o_gen == c->generation);
+    if (!is_x && !is_o) {
+        return server_send_err_ref(srv, idx, game_id, ERR_NOT_IN_GAME, "Player not assigned to this match");
+    }
+
+    /* Step 3: Turn validation */
+    caro_cell_t mover_stone = is_x ? CELL_X : CELL_O;
+    if (slot->game.current_turn != mover_stone) {
+        return server_send_err_ref(srv, idx, game_id, ERR_NOT_YOUR_TURN, "Not your turn");
+    }
+
+    /* Step 4: Sequence validation */
+    if (seq != slot->game.expected_seq) {
+        return server_send_err_ref(srv, idx, game_id, ERR_SEQ_MISMATCH, "Sequence number mismatch");
+    }
+
+    /* Step 5: Coordinate bounds validation [0..14] */
+    if (row < 0 || row >= CARO_BOARD_SIZE || col < 0 || col >= CARO_BOARD_SIZE) {
+        return server_send_err_ref(srv, idx, game_id, ERR_INVALID_MOVE, "Coordinates out of bounds");
+    }
+
+    /* Step 6: Empty cell validation */
+    if (slot->game.board[row][col] != CELL_EMPTY) {
+        return server_send_err_ref(srv, idx, game_id, ERR_INVALID_MOVE, "Cell is already occupied");
+    }
+
+    /* Execute move via rules engine */
+    if (!game_make_move(&slot->game, mover_stone, row, col)) {
+        return server_send_err_ref(srv, idx, game_id, ERR_INVALID_MOVE, "Illegal move");
+    }
+
+    /* Send MOVE_ACK to mover */
+    char ack_payload[PROTO_MAX_PAYLOAD_SIZE];
+    uint8_t frame_buf[PROTO_MAX_FRAME_BUFFER];
+    size_t frame_len = 0;
+    snprintf(ack_payload, sizeof(ack_payload), "MOVE_ACK\t%u\t%u\t%d\t%d\n", game_id, seq, row, col);
+    if (protocol_pack_frame(ack_payload, strlen(ack_payload), frame_buf, sizeof(frame_buf), &frame_len) == PROTO_OK) {
+        server_queue_send(srv, idx, frame_buf, frame_len);
+    }
+
+    /* Send MOVE_BROADCAST to opponent */
+    int opp_idx = is_x ? slot->player_o_idx : slot->player_x_idx;
+    uint32_t opp_gen = is_x ? slot->player_o_gen : slot->player_x_gen;
+    if (opp_idx >= 0 && opp_idx < SERVER_MAX_CLIENTS &&
+        srv->clients[opp_idx].fd >= 0 && srv->clients[opp_idx].generation == opp_gen) {
+        char bcast_payload[PROTO_MAX_PAYLOAD_SIZE];
+        snprintf(bcast_payload, sizeof(bcast_payload), "MOVE_BROADCAST\t%u\t%u\t%d\t%d\n", game_id, seq, row, col);
+        if (protocol_pack_frame(bcast_payload, strlen(bcast_payload), frame_buf, sizeof(frame_buf), &frame_len) == PROTO_OK) {
+            server_queue_send(srv, opp_idx, frame_buf, frame_len);
+        }
+    }
+
+    /* Persist move */
+    if (c->user_id > 0) {
+        storage_record_move(game_id, seq, c->user_id, is_x ? "X" : "O", row, col);
+    }
+
+    /* Structured per-game move log (F20) */
+    game_log_move(game_id, seq, is_x ? "X" : "O", c->user_id, c->username, row, col);
+
+    /* Check match conclusion */
+    if (slot->game.status == GAME_STATUS_FINISHED) {
+        if (slot->game.result == GAME_RESULT_X_WON) {
+            game_manager_conclude(srv, game_id, "WIN", "FIVE_IN_A_ROW", slot->player_x_idx, slot->player_o_idx, false);
+        } else if (slot->game.result == GAME_RESULT_O_WON) {
+            game_manager_conclude(srv, game_id, "WIN", "FIVE_IN_A_ROW", slot->player_o_idx, slot->player_x_idx, false);
+        } else if (slot->game.result == GAME_RESULT_DRAW) {
+            game_manager_conclude(srv, game_id, "DRAW", "BOARD_FULL", -1, -1, true);
+        }
+    }
+
+    return 0;
+}
+
+/* ========================================================================= */
+/* Challenge & Invitation Flow (F15)                                         */
+/* ========================================================================= */
+
+int challenge_create(server_t *srv, int challenger_idx, const char *target_name, uint32_t req_id) {
+    if (!srv || challenger_idx < 0 || challenger_idx >= SERVER_MAX_CLIENTS || !target_name) {
+        return -1;
+    }
+    client_conn_t *c_src = &srv->clients[challenger_idx];
+
+    /* 1. Challenger must be in LOBBY */
+    if (c_src->state == STATE_IN_GAME || c_src->state == STATE_IN_INVITE) {
+        return server_send_err_ref(srv, challenger_idx, req_id, ERR_USER_BUSY, "You are currently busy or in a match");
+    }
+    if (c_src->state != STATE_IN_LOBBY) {
+        return server_send_err_ref(srv, challenger_idx, req_id, ERR_UNAUTHORIZED, "Login required to challenge");
+    }
+
+    /* 2. Locate target user */
+    int target_idx = -1;
+    for (int i = 0; i < SERVER_MAX_CLIENTS; ++i) {
+        if (srv->clients[i].fd >= 0 && strcasecmp(srv->clients[i].username, target_name) == 0) {
+            target_idx = i;
+            break;
+        }
+    }
+    if (target_idx < 0) {
+        return server_send_err_ref(srv, challenger_idx, req_id, ERR_USER_NOT_FOUND, "Target user not found");
+    }
+
+    /* 3. Cannot challenge self */
+    if (target_idx == challenger_idx) {
+        return server_send_err_ref(srv, challenger_idx, req_id, ERR_INVALID_PARAM, "Cannot challenge yourself");
+    }
+
+    /* 4. Target must be in LOBBY */
+    client_conn_t *c_tgt = &srv->clients[target_idx];
+    if (c_tgt->state != STATE_IN_LOBBY) {
+        return server_send_err_ref(srv, challenger_idx, req_id, ERR_USER_BUSY, "Target user is currently busy or in a match");
+    }
+
+    /* 5. Find free invite slot */
+    int slot = -1;
+    for (int i = 0; i < SERVER_MAX_INVITES; ++i) {
+        if (!srv->invites[i].active) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        return server_send_err_ref(srv, challenger_idx, req_id, ERR_INTERNAL_SERVER, "Server invite capacity reached");
+    }
+
+    /* 6. Allocate invite and lock both participants */
+    uint32_t inv_id = srv->next_invite_id++;
+    if (inv_id == 0) inv_id = srv->next_invite_id++;
+
+    challenge_invite_t *inv = &srv->invites[slot];
+    inv->active = true;
+    inv->invite_id = inv_id;
+    inv->req_id = req_id;
+    inv->challenger_idx = challenger_idx;
+    inv->challenger_gen = c_src->generation;
+    inv->target_idx = target_idx;
+    inv->target_gen = c_tgt->generation;
+    inv->created_at = time(NULL);
+    inv->expires_at = inv->created_at + (srv->invite_timeout_sec > 0 ? srv->invite_timeout_sec : DEFAULT_INVITE_TIMEOUT_SEC);
+    inv->expires_at_ms = current_time_ms() + (srv->invite_timeout_ms > 0 ? srv->invite_timeout_ms : (DEFAULT_INVITE_TIMEOUT_SEC * 1000));
+
+    c_src->state = STATE_IN_INVITE;
+    c_src->pending_invite_id = inv_id;
+    c_tgt->state = STATE_IN_INVITE;
+    c_tgt->pending_invite_id = inv_id;
+
+    /* 7. Send OK to challenger */
+    server_send_ok(srv, challenger_idx, req_id, NULL);
+
+    /* 8. Send CHALLENGE_REQ to target */
+    char req_payload[PROTO_MAX_PAYLOAD_SIZE];
+    int written = snprintf(req_payload, sizeof(req_payload), "CHALLENGE_REQ\t%u\t%u\t%s\n",
+                           inv_id, c_src->user_id, c_src->username);
+    uint8_t frame_buf[PROTO_MAX_PAYLOAD_SIZE + PROTO_HEADER_SIZE];
+    size_t frame_len = 0;
+    if (protocol_pack_frame(req_payload, (size_t)written, frame_buf, sizeof(frame_buf), &frame_len) == PROTO_OK) {
+        server_queue_send(srv, target_idx, frame_buf, frame_len);
+    }
+
+    printf("[CHALLENGE] Created invite %u: '%s' (slot %d) -> '%s' (slot %d)\n",
+           inv_id, c_src->username, challenger_idx, c_tgt->username, target_idx);
+
+    server_broadcast_online_list(srv);
+    return 0;
+}
+
+int challenge_respond(server_t *srv, int responder_idx, uint32_t invite_id, bool accept) {
+    if (!srv || responder_idx < 0 || responder_idx >= SERVER_MAX_CLIENTS) return -1;
+    client_conn_t *c_resp = &srv->clients[responder_idx];
+
+    /* 1. Find active invite */
+    int slot = -1;
+    for (int i = 0; i < SERVER_MAX_INVITES; ++i) {
+        if (srv->invites[i].active && srv->invites[i].invite_id == invite_id) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        return server_send_err_ref(srv, responder_idx, invite_id, ERR_INVITE_INVALID, "Invalid or expired invitation ID");
+    }
+
+    challenge_invite_t *inv = &srv->invites[slot];
+
+    /* 2. Validate responder identity (Invalid Responder check TC-T2-06) */
+    if (inv->target_idx != responder_idx || inv->target_gen != c_resp->generation) {
+        return server_send_err_ref(srv, responder_idx, invite_id, ERR_INVITE_INVALID, "You are not the recipient of this invitation");
+    }
+
+    int c_idx = inv->challenger_idx;
+    uint32_t c_gen = inv->challenger_gen;
+
+    /* 3. Handle Decline */
+    if (!accept) {
+        inv->active = false;
+        c_resp->state = STATE_IN_LOBBY;
+        c_resp->pending_invite_id = 0;
+
+        if (srv->clients[c_idx].fd >= 0 && srv->clients[c_idx].generation == c_gen) {
+            srv->clients[c_idx].state = STATE_IN_LOBBY;
+            srv->clients[c_idx].pending_invite_id = 0;
+            server_send_err_ref(srv, c_idx, inv->req_id, ERR_USER_BUSY, "Invitation declined");
+        }
+        printf("[CHALLENGE] Invite %u declined by '%s'\n", invite_id, c_resp->username);
+        server_broadcast_online_list(srv);
+        return 0;
+    }
+
+    /* 4. Handle Accept: Check challenger still connected */
+    if (srv->clients[c_idx].fd < 0 || srv->clients[c_idx].generation != c_gen) {
+        inv->active = false;
+        c_resp->state = STATE_IN_LOBBY;
+        c_resp->pending_invite_id = 0;
+        server_broadcast_online_list(srv);
+        return server_send_err_ref(srv, responder_idx, invite_id, ERR_USER_NOT_FOUND, "Challenger disconnected");
+    }
+
+    /* Deactivate invite & unlock participants */
+    inv->active = false;
+    c_resp->pending_invite_id = 0;
+    srv->clients[c_idx].pending_invite_id = 0;
+
+    /* 5. Start match via game_manager_start */
+    return game_manager_start(srv, c_idx, responder_idx);
+}
+
+void challenge_check_timeouts(server_t *srv) {
+    if (!srv) return;
+    int64_t now_ms = current_time_ms();
+
+    for (int i = 0; i < SERVER_MAX_INVITES; ++i) {
+        if (!srv->invites[i].active) continue;
+
+        if (now_ms >= srv->invites[i].expires_at_ms) {
+            challenge_invite_t *inv = &srv->invites[i];
+            int c_idx = inv->challenger_idx;
+            int t_idx = inv->target_idx;
+
+            printf("[CHALLENGE] Invite %u expired (timeout %ds)\n",
+                   inv->invite_id, srv->invite_timeout_sec);
+
+            /* Unlock challenger and send ERR 302 */
+            if (srv->clients[c_idx].fd >= 0 && srv->clients[c_idx].generation == inv->challenger_gen) {
+                srv->clients[c_idx].state = STATE_IN_LOBBY;
+                srv->clients[c_idx].pending_invite_id = 0;
+                server_send_err_ref(srv, c_idx, inv->req_id, ERR_INVITE_EXPIRED, "Challenge invitation expired (30s timeout)");
+            }
+
+            /* Unlock target */
+            if (srv->clients[t_idx].fd >= 0 && srv->clients[t_idx].generation == inv->target_gen) {
+                srv->clients[t_idx].state = STATE_IN_LOBBY;
+                srv->clients[t_idx].pending_invite_id = 0;
+            }
+
+            inv->active = false;
+            inv->invite_id = 0;
+            server_broadcast_online_list(srv);
+        }
+    }
+}
+
+void challenge_handle_disconnect(server_t *srv, int client_idx) {
+    if (!srv || client_idx < 0 || client_idx >= SERVER_MAX_CLIENTS) return;
+
+    for (int i = 0; i < SERVER_MAX_INVITES; ++i) {
+        if (!srv->invites[i].active) continue;
+
+        /* If disconnected client was challenger */
+        if (srv->invites[i].challenger_idx == client_idx &&
+            srv->invites[i].challenger_gen == srv->clients[client_idx].generation) {
+            int t_idx = srv->invites[i].target_idx;
+            if (srv->clients[t_idx].fd >= 0 && srv->clients[t_idx].generation == srv->invites[i].target_gen) {
+                srv->clients[t_idx].state = STATE_IN_LOBBY;
+                srv->clients[t_idx].pending_invite_id = 0;
+                printf("[CHALLENGE] Target slot %d unlocked due to challenger disconnect\n", t_idx);
+            }
+            srv->invites[i].active = false;
+        }
+        /* If disconnected client was target */
+        else if (srv->invites[i].target_idx == client_idx &&
+                 srv->invites[i].target_gen == srv->clients[client_idx].generation) {
+            int c_idx = srv->invites[i].challenger_idx;
+            if (srv->clients[c_idx].fd >= 0 && srv->clients[c_idx].generation == srv->invites[i].challenger_gen) {
+                srv->clients[c_idx].state = STATE_IN_LOBBY;
+                srv->clients[c_idx].pending_invite_id = 0;
+                server_send_err_ref(srv, c_idx, srv->invites[i].req_id, ERR_USER_BUSY, "Target user disconnected");
+                printf("[CHALLENGE] Challenger slot %d unlocked due to target disconnect\n", c_idx);
+            }
+            srv->invites[i].active = false;
+        }
+    }
 }
 
 void server_disconnect_client(server_t *srv, int idx, const char *reason) {
@@ -571,20 +1277,13 @@ void server_disconnect_client(server_t *srv, int idx, const char *reason) {
     printf("[-] Client disconnected [slot %d, fd=%d, gen=%u, %s:%u]: %s\n",
            idx, c->fd, c->generation, c->ip_str, c->port, reason ? reason : "Unknown reason");
 
-    /* If client was in an active game, handle opponent notification cleanly */
+    /* Handle challenge disconnect cleanup (F15) */
+    challenge_handle_disconnect(srv, idx);
+
+    /* If client was in an active game, forfeit cleanly and notify opponent via GAME_OVER (F19) */
     if (c->current_game_id > 0) {
-        uint32_t gid = c->current_game_id;
+        game_manager_handle_disconnect(srv, idx);
         c->current_game_id = 0;
-        for (int i = 0; i < SERVER_MAX_CLIENTS; ++i) {
-            if (i != idx && srv->clients[i].fd >= 0 && srv->clients[i].current_game_id == gid) {
-                printf("[*] Opponent in slot %d notified of game %u abort due to disconnect\n", i, gid);
-                server_send_err(srv, i, ERR_GAME_NOT_FOUND, "Opponent disconnected");
-                srv->clients[i].current_game_id = 0;
-                if (srv->clients[i].state == STATE_IN_GAME) {
-                    srv->clients[i].state = STATE_IN_LOBBY;
-                }
-            }
-        }
     }
 
     socket_close(c->fd);
@@ -599,6 +1298,7 @@ void server_disconnect_client(server_t *srv, int idx, const char *reason) {
     c->username[0] = '\0';
     c->is_guest = false;
     c->current_game_id = 0;
+    c->pending_invite_id = 0;
     memset(c->rx_buf, 0, sizeof(c->rx_buf));
     memset(c->tx_buf, 0, sizeof(c->tx_buf));
 
@@ -747,8 +1447,18 @@ int server_handle_client_payload(server_t *srv, int idx, const char *payload, si
     protocol_msg_t msg;
     int parse_res = protocol_parse_msg(payload, len, &msg);
     if (parse_res != PROTO_OK) {
+        /* Check if this was an invalid MOVE command (e.g. coordinates out of bounds >14) */
+        char temp_tokens[PROTO_MAX_TOKENS][PROTO_MAX_TOKEN_LEN];
+        int tok_count = 0;
+        if (protocol_tokenize(payload, len, temp_tokens, &tok_count) == PROTO_OK && tok_count >= 2) {
+            if (strcmp(temp_tokens[0], "MOVE") == 0) {
+                uint32_t gid = (uint32_t)strtoul(temp_tokens[1], NULL, 10);
+                return server_send_err_ref(srv, idx, gid, ERR_INVALID_PARAM, "Invalid move parameters");
+            }
+        }
         fprintf(stderr, "[-] Invalid message syntax from client %d: %s\n", idx, payload);
-        return server_send_err(srv, idx, ERR_BAD_FRAME, "Invalid protocol format");
+        int err_code = (parse_res == PROTO_ERR_INVALID_PARAM) ? ERR_INVALID_PARAM : ERR_BAD_FRAME;
+        return server_send_err(srv, idx, err_code, "Invalid protocol format");
     }
 
     switch (msg.cmd) {
@@ -783,6 +1493,7 @@ int server_handle_client_payload(server_t *srv, int idx, const char *payload, si
             for (int i = 0; i < SERVER_MAX_CLIENTS && offset < (int)(sizeof(list_payload) - 64); ++i) {
                 if (srv->clients[i].fd >= 0) {
                     const char *st_str = (srv->clients[i].state == STATE_IN_GAME) ? "IN_GAME" :
+                                         (srv->clients[i].state == STATE_IN_INVITE) ? "BUSY" :
                                          (srv->clients[i].state == STATE_IN_LOBBY) ? "LOBBY" : "IDLE";
                     offset += snprintf(list_payload + offset, sizeof(list_payload) - (size_t)offset,
                                        "\t%s:%s", srv->clients[i].username, st_str);
@@ -860,6 +1571,117 @@ int server_handle_client_payload(server_t *srv, int idx, const char *payload, si
             snprintf(req.password, sizeof(req.password), "%s", password);
 
             return server_queue_db_request(srv, &req);
+        }
+
+        case CMD_CHALLENGE: {
+            if (msg.token_count < 3) {
+                return server_send_err_ref(srv, idx, msg.request_id, ERR_INVALID_PARAM, "Invalid parameters for CHALLENGE");
+            }
+            return challenge_create(srv, idx, msg.tokens[2], msg.request_id);
+        }
+
+        case CMD_CHALLENGE_RESP: {
+            if (msg.token_count < 3) {
+                return server_send_err_ref(srv, idx, msg.request_id, ERR_INVALID_PARAM, "Invalid parameters for CHALLENGE_RESP");
+            }
+            uint32_t invite_id = msg.request_id;
+            bool accept = false;
+            if (strcmp(msg.tokens[2], "1") == 0 || strcasecmp(msg.tokens[2], "ACCEPT") == 0) {
+                accept = true;
+            } else if (strcmp(msg.tokens[2], "0") == 0 || strcasecmp(msg.tokens[2], "DECLINE") == 0) {
+                accept = false;
+            } else {
+                return server_send_err_ref(srv, idx, invite_id, ERR_INVALID_PARAM, "Invalid accept token (must be 0 or 1)");
+            }
+            return challenge_respond(srv, idx, invite_id, accept);
+        }
+
+        case CMD_MOVE: {
+            return game_manager_handle_move(srv, idx, msg.game_id, msg.seq, msg.move_row, msg.move_col);
+        }
+
+        case CMD_RESIGN: {
+            if (c->state != STATE_IN_GAME || c->current_game_id == 0) {
+                return server_send_err(srv, idx, ERR_NOT_IN_GAME, "Not currently in a match");
+            }
+            uint32_t gid = (msg.game_id > 0) ? msg.game_id : c->current_game_id;
+            if (gid != c->current_game_id) {
+                return server_send_err_ref(srv, idx, gid, ERR_NOT_IN_GAME, "Not a participant in this game");
+            }
+
+            game_slot_t *slot = server_find_game(srv, gid);
+            if (!slot || slot->settled) {
+                return server_send_err_ref(srv, idx, gid, ERR_GAME_NOT_FOUND, "Game not active or already concluded");
+            }
+
+            int winner_idx = (idx == slot->player_x_idx) ? slot->player_o_idx : slot->player_x_idx;
+            return game_manager_conclude(srv, gid, "RESIGN", "RESIGNATION", winner_idx, idx, false);
+        }
+
+        case CMD_OFFER_DRAW: {
+            if (c->state != STATE_IN_GAME || c->current_game_id == 0) {
+                return server_send_err(srv, idx, ERR_NOT_IN_GAME, "Not currently in a match");
+            }
+            uint32_t gid = (msg.game_id > 0) ? msg.game_id : c->current_game_id;
+            if (gid != c->current_game_id) {
+                return server_send_err_ref(srv, idx, gid, ERR_NOT_IN_GAME, "Not a participant in this game");
+            }
+
+            game_slot_t *slot = server_find_game(srv, gid);
+            if (!slot || slot->settled) {
+                return server_send_err_ref(srv, idx, gid, ERR_GAME_NOT_FOUND, "Game not active");
+            }
+
+            bool is_x = (idx == slot->player_x_idx);
+            slot->draw_offered_by = is_x ? CELL_X : CELL_O;
+
+            int opp_idx = is_x ? slot->player_o_idx : slot->player_x_idx;
+            if (opp_idx >= 0 && opp_idx < SERVER_MAX_CLIENTS && srv->clients[opp_idx].fd >= 0) {
+                char notify[64];
+                snprintf(notify, sizeof(notify), "OFFER_DRAW\t%u\n", gid);
+                uint8_t fbuf[128]; size_t flen = 0;
+                protocol_pack_frame(notify, strlen(notify), fbuf, sizeof(fbuf), &flen);
+                server_queue_send(srv, opp_idx, fbuf, flen);
+            }
+            return 0;
+        }
+
+        case CMD_DRAW_RESP: {
+            if (c->state != STATE_IN_GAME || c->current_game_id == 0) {
+                return server_send_err(srv, idx, ERR_NOT_IN_GAME, "Not currently in a match");
+            }
+            uint32_t gid = (msg.game_id > 0) ? msg.game_id : c->current_game_id;
+            if (gid != c->current_game_id) {
+                return server_send_err_ref(srv, idx, gid, ERR_NOT_IN_GAME, "Not a participant in this game");
+            }
+
+            game_slot_t *slot = server_find_game(srv, gid);
+            if (!slot || slot->settled) {
+                return server_send_err_ref(srv, idx, gid, ERR_GAME_NOT_FOUND, "Game not active");
+            }
+
+            bool accept = false;
+            if (msg.token_count > 2) {
+                const char *t = msg.tokens[2];
+                if (strcmp(t, "1") == 0 || strcasecmp(t, "ACCEPT") == 0) {
+                    accept = true;
+                }
+            }
+
+            if (accept) {
+                return game_manager_conclude(srv, gid, "DRAW", "MUTUAL_AGREEMENT", -1, -1, true);
+            } else {
+                slot->draw_offered_by = CELL_EMPTY;
+                int opp_idx = (idx == slot->player_x_idx) ? slot->player_o_idx : slot->player_x_idx;
+                if (opp_idx >= 0 && opp_idx < SERVER_MAX_CLIENTS && srv->clients[opp_idx].fd >= 0) {
+                    char decl[64];
+                    snprintf(decl, sizeof(decl), "DRAW_RESP\t%u\t0\n", gid);
+                    uint8_t fbuf[128]; size_t flen = 0;
+                    protocol_pack_frame(decl, strlen(decl), fbuf, sizeof(fbuf), &flen);
+                    server_queue_send(srv, opp_idx, fbuf, flen);
+                }
+                return 0;
+            }
         }
 
         case CMD_ERR: {
@@ -1190,6 +2012,9 @@ int server_run(server_t *srv) {
                 }
             }
         }
+
+        /* Check challenge invite timeouts (F15) */
+        challenge_check_timeouts(srv);
 
         /* 1. Handle incoming connections on listener */
         if (ret > 0 && (srv->poll_fds[0].revents & POLLIN)) {
