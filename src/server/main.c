@@ -17,18 +17,27 @@ static void handle_signal(int sig) {
 int main(int argc, char *argv[]) {
     int port = DEFAULT_SERVER_PORT;
     const char *host = DEFAULT_SERVER_HOST;
+    const char *db_path = NULL;
     bool test_mode = false;
+
+    /* Check environment variable for DB path */
+    const char *env_db = getenv("CARO_DB_PATH");
+    if (env_db && *env_db) {
+        db_path = env_db;
+    }
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
             port = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-h") == 0 && i + 1 < argc) {
             host = argv[++i];
+        } else if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) {
+            db_path = argv[++i];
         } else if (strcmp(argv[i], "--test") == 0) {
             test_mode = true;
         } else if (strcmp(argv[i], "--help") == 0) {
             printf("Caro Server (C/Linux)\n");
-            printf("Usage: %s [-h host] [-p port] [--test]\n", argv[0]);
+            printf("Usage: %s [-h host] [-p port] [-d db_path] [--test]\n", argv[0]);
             return 0;
         }
     }
@@ -43,7 +52,7 @@ int main(int argc, char *argv[]) {
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
 
-    if (server_init(&g_server, host, port) != 0) {
+    if (server_init(&g_server, host, port, db_path) != 0) {
         fprintf(stderr, "[-] Failed to initialize server\n");
         return 1;
     }

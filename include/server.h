@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <time.h>
+#include <pthread.h>
 
 #if defined(_WIN32)
     #include <winsock2.h>
@@ -30,6 +31,8 @@
 
 #include "protocol.h"
 #include "game.h"
+#include "storage.h"
+#include "auth.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -47,6 +50,13 @@ extern "C" {
 #define SERVER_READ_BUDGET_BYTES    32768
 #define SERVER_FRAME_BUDGET         16
 #define SERVER_FRAME_TIMEOUT_SEC    10
+
+/* Event Loop & Queue Limits (R2) */
+#define SERVER_MAX_POLL_FDS         (SERVER_MAX_CLIENTS + 2) /* index 0=listener, 1=db_pipe, 2..65=clients */
+#define DB_QUEUE_CAPACITY           64
+#define AUTH_MAX_FAILED_ATTEMPTS    5
+#define AUTH_LOCKOUT_DURATION_SEC   30
+#define MAX_AUTH_THROTTLE_ENTRIES   64
 
 /* Client connection states */
 typedef enum {
@@ -68,6 +78,7 @@ typedef enum {
 /* Per-client connection context */
 typedef struct {
     int             fd;                         /* Socket file descriptor (-1 if empty slot) */
+    uint32_t        generation;                 /* Monotonic generation counter to prevent stale async results */
     client_state_t  state;                      /* Connection state */
     char            ip_str[INET6_ADDRSTRLEN];   /* Client IP string */
     uint16_t        port;                       /* Client port */
@@ -92,32 +103,103 @@ typedef struct {
     uint32_t        current_game_id;            /* Active game ID (0 if none) */
 } client_conn_t;
 
+/* Database Worker Request / Response Types */
+typedef enum {
+    DB_REQ_REGISTER,
+    DB_REQ_LOGIN,
+    DB_REQ_SETTLE_GAME
+} db_req_type_t;
+
+typedef struct {
+    uint32_t        req_id;
+    int             client_idx;
+    uint32_t        generation;
+    db_req_type_t   type;
+    char            username[32];
+    char            password[64];
+    /* settlement fields */
+    uint32_t        game_id;
+    uint32_t        winner_id;
+    uint32_t        loser_id;
+    bool            is_draw;
+    char            outcome[16];
+    char            reason[32];
+} db_request_t;
+
+typedef struct {
+    uint32_t        req_id;
+    int             client_idx;
+    uint32_t        generation;
+    db_req_type_t   type;
+    int             status_code;    /* 0 on success, error code otherwise */
+    char            error_msg[64];
+    uint32_t        user_id;
+    char            username[32];
+    int             points;
+    int             wins;
+    int             draws;
+    int             losses;
+} db_response_t;
+
+/* Per-user authentication throttling entry */
+typedef struct {
+    char            username[32];
+    int             failed_attempts;
+    time_t          lockout_until;
+    time_t          last_attempt_ts;
+} auth_throttle_entry_t;
+
 /* Server master structure */
 typedef struct {
     int             listen_fd;
     char            host[64];
     int             port;
+    char            db_path[256];
     volatile bool   running;
 
     /* Clients tracking */
     client_conn_t   clients[SERVER_MAX_CLIENTS];
     size_t          active_clients_count;
 
-    /* Pollfd array: index 0 is listen_fd, 1..SERVER_MAX_CLIENTS are active clients */
-    caro_pollfd_t   poll_fds[SERVER_MAX_CLIENTS + 1];
+    /* Pollfd array: index 0 is listen_fd, 1 is db_pipe[0], 2..SERVER_MAX_CLIENTS+1 are clients */
+    caro_pollfd_t   poll_fds[SERVER_MAX_POLL_FDS];
     nfds_t          poll_count;
-    int             client_map[SERVER_MAX_CLIENTS + 1]; /* Maps poll_fds index -> clients[] index */
+    int             client_map[SERVER_MAX_POLL_FDS]; /* Maps poll_fds index -> clients[] index */
+
+    /* Database Worker & Synchronization */
+    pthread_t       db_worker_thread;
+    bool            db_worker_started;
+    volatile bool   db_worker_shutdown;
+    pthread_mutex_t db_queue_mutex;
+    pthread_cond_t  db_queue_cond;
+    int             db_pipe[2]; /* Self-pipe for worker -> main thread notification */
+
+    /* Request queue */
+    db_request_t    db_req_queue[DB_QUEUE_CAPACITY];
+    int             db_req_head;
+    int             db_req_tail;
+    int             db_req_count;
+
+    /* Response queue */
+    db_response_t   db_resp_queue[DB_QUEUE_CAPACITY];
+    int             db_resp_head;
+    int             db_resp_tail;
+    int             db_resp_count;
+
+    /* Auth throttle table */
+    auth_throttle_entry_t throttle_table[MAX_AUTH_THROTTLE_ENTRIES];
 } server_t;
 
 /**
- * @brief Initialize server structure, bind to host:port and listen non-blocking.
+ * @brief Initialize server structure, bind to host:port, open storage, and start DB worker.
  * 
  * @param srv Pointer to server_t instance
  * @param host Bind address (e.g., "0.0.0.0")
  * @param port Port number (e.g., 8888)
+ * @param db_path Database path (if NULL or empty, defaults to CARO_DB_PATH or "caro.db")
  * @return 0 on success, negative error code on failure.
  */
-int server_init(server_t *srv, const char *host, int port);
+int server_init(server_t *srv, const char *host, int port, const char *db_path);
 
 /**
  * @brief Set socket fd to non-blocking mode.
@@ -143,14 +225,14 @@ int server_run(server_t *srv);
 void server_stop(server_t *srv);
 
 /**
- * @brief Close all open client sockets and listener fd, free server resources.
+ * @brief Close all open client sockets, stop worker thread, close DB and self-pipe.
  * 
  * @param srv Pointer to server_t instance
  */
 void server_cleanup(server_t *srv);
 
 /**
- * @brief Safely close client socket, release resources, and clear slot.
+ * @brief Safely close client socket, release resources, advance generation, and clear slot.
  * 
  * @param srv Pointer to server_t instance
  * @param idx Index of client in srv->clients array (0 <= idx < SERVER_MAX_CLIENTS)
@@ -171,66 +253,56 @@ int server_queue_send(server_t *srv, int idx, const uint8_t *data, size_t len);
 
 /**
  * @brief Send standard ERR message to client with framing.
- * 
- * @param srv Pointer to server_t instance
- * @param idx Client index
- * @param err_code Standard error code from protocol_err_t
- * @param reason Optional custom error message string (if NULL, default is used)
- * @return 0 on success, negative on error.
  */
 int server_send_err(server_t *srv, int idx, int err_code, const char *reason);
 
 /**
+ * @brief Send ERR message with request_id reference: "ERR\t<ref_id>\t<code>\t<reason>\n"
+ */
+int server_send_err_ref(server_t *srv, int idx, uint32_t ref_id, int err_code, const char *reason);
+
+/**
+ * @brief Send OK message with request_id and optional extra fields: "OK\t<req_id>\t<extra>\n"
+ */
+int server_send_ok(server_t *srv, int idx, uint32_t req_id, const char *extra_data);
+
+/**
+ * @brief Enqueue a DB request to the async worker queue. Rejects immediately if full.
+ */
+int server_queue_db_request(server_t *srv, const db_request_t *req);
+
+/**
+ * @brief Drain DB worker response notifications from self-pipe and dispatch completed responses.
+ */
+void server_handle_db_responses(server_t *srv);
+
+/**
  * @brief Handle POLLIN event on client socket (read non-blocking and unpack frames).
- * 
- * @param srv Pointer to server_t instance
- * @param idx Client index
- * @return 0 on success, negative on disconnect/error.
  */
 int server_handle_client_read(server_t *srv, int idx);
 
 /**
  * @brief Process pending frames in client's user-space rx_buf up to SERVER_FRAME_BUDGET.
- * 
- * @param srv Pointer to server_t instance
- * @param idx Client index
- * @return 0 on success, negative on disconnect/error.
  */
 int server_process_pending_frames(server_t *srv, int idx);
 
 /**
  * @brief Handle POLLOUT event on client socket (send queued tx_buf data non-blocking).
- * 
- * @param srv Pointer to server_t instance
- * @param idx Client index
- * @return 0 on success, negative on disconnect/error.
  */
 int server_handle_client_write(server_t *srv, int idx);
 
 /**
  * @brief Dispatch unpacked payload message for a client.
- * 
- * @param srv Pointer to server_t instance
- * @param idx Client index
- * @param payload Extracted payload string
- * @param len Payload length
- * @return 0 on success, negative on error.
  */
 int server_handle_client_payload(server_t *srv, int idx, const char *payload, size_t len);
 
 /**
  * @brief Accept pending incoming TCP connections on listener socket non-blocking.
- * 
- * @param srv Pointer to server_t instance
- * @return Number of accepted connections, or negative on error.
  */
 int server_accept_new_client(server_t *srv);
 
 /**
  * @brief Broadcast CMD_ONLINE_LIST to all active authenticated and lobby clients.
- * 
- * @param srv Pointer to server_t instance
- * @return 0 on success, negative on error.
  */
 int server_broadcast_online_list(server_t *srv);
 
